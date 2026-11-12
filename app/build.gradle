@@ -1,0 +1,78 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'dev.teton.somniel'
+    compileSdk 35
+    ndkVersion '30.0.16248370'
+
+    defaultConfig {
+        applicationId 'dev.teton.somniel'
+        minSdk 29          // Vulkan 1.1 baseline; target devices run Android 13+
+        targetSdk 35
+        versionCode 2
+        versionName '0.1.1'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_shared', '-DSDL_SHARED=ON'
+            }
+        }
+    }
+
+    // Release signing: the key every Somniel APK so far was signed with (the Android debug key), so a new build installs
+    // over an old one. The keystore and its passwords live in signing/ (not in version control; back it up: losing it
+    // means nobody can update without uninstalling).
+    def signingProps = new Properties()
+    def signingFile = rootProject.file('signing/signing.properties')
+    if (signingFile.exists()) signingFile.withInputStream { signingProps.load(it) }
+    signingConfigs {
+        release {
+            if (signingFile.exists()) {
+                storeFile rootProject.file('signing/' + signingProps['storeFile'])
+                storePassword signingProps['storePassword']
+                keyAlias signingProps['keyAlias']
+                keyPassword signingProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true   // the test scripts need run-as access
+            // optimised native code with symbols: the default Debug type is -O0, which the renderer's replay loop,
+            // the texture deswizzler and the hashes cannot afford
+            externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo' } }
+        }
+        release {
+            minifyEnabled false
+            if (signingFile.exists()) signingConfig signingConfigs.release
+            // same optimised native code as the debug type (the default release flags differ and are untested)
+            externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo' } }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+        }
+    }
+
+    // native libraries are extracted to nativeLibraryDir: libadrenotools loads its hook libraries from there (custom
+    // GPU drivers, gpu_driver.c)
+    packaging {
+        jniLibs { useLegacyPackaging true }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // .7z import (ModImporter): the container reader and its LZMA decoder
+    implementation 'org.apache.commons:commons-compress:1.27.1'
+    implementation 'org.tukaani:xz:1.10'
+}

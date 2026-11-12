@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Telemetry server. Leave both empty to build without telemetry (no prompt, no toggle, nothing sent).
+         telemetry-server\setup.ps1 fills these in. -->
+    <string name="telemetry_url" translatable="false"></string>
+    <string name="telemetry_key" translatable="false"></string>
+</resources>
