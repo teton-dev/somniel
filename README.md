@@ -5,7 +5,7 @@
 the game's own AArch64 code runs directly on your phone's CPU, and Somniel supplies what sits underneath it (a
 Horizon OS layer, an NVN-to-Vulkan renderer, audio, input and save data).
 
-> **Early, experimental software.** Expect bugs. Please read [What to expect](#what-to-expect) before installing.
+> **Early, experimental software, heavily assisted by Claude.** Expect bugs. Please read [What to expect](#what-to-expect) before installing.
 
 Somniel contains **no game files**. You need your own legally obtained copy of Fire Emblem Engage with the 2.0.0
 update, and your own console keys. The first-run setup dialog walks you through picking them.
