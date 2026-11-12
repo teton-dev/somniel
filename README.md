@@ -1,6 +1,5 @@
 # Somniel
-
-<p align="center"><img src="app/src/main/ic_launcher-playstore.png" width="160" alt="Somniel icon"></p>
+<img src="ic_launcher-playstore.png" width="160" alt="Somniel icon">
 
 **Somniel runs Fire Emblem Engage (v2.0.0) natively on Android.** It is not an emulator and not a static recompilation:
 the game's own AArch64 code runs directly on your phone's CPU, and Somniel supplies what sits underneath it (a
