@@ -27,7 +27,7 @@ The first boot takes longer than later ones while the game's shaders are prepare
 
 ## Tested hardware
 
-Somniel has only been tested on a Retroid Pocket 6, both 8GB and 12GB models, so it's built against the Snapdragon 8 Gen 2 SOC, where it maintains a relatively stable 60FPS. 
+Somniel has only been tested on a Retroid Pocket 6 and AYN Thor, both 8GB and 12GB models, so it's built against the Snapdragon 8 Gen 2 SOC, where it maintains a relatively stable 60FPS. 
 
 - **Mali and Xclipse GPUs are completely untested and are unlikely to work.** The renderer was built and verified
   against the Adreno 740 driver. On a non-Adreno device the app shows a warning on first boot; you can still try, but
