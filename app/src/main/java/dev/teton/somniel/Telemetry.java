@@ -13,6 +13,8 @@ import android.opengl.GLES20;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.widget.CheckBox;
+import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 
@@ -144,8 +146,18 @@ final class Telemetry {
     // ---- dialogs ----
 
     void showGpuWarning(Runnable then) {
+        if (prefs.getBoolean("gpu_warning_hidden", false)) { // "Don't show again" was ticked
+            if (then != null) then.run();
+            return;
+        }
         String gpu = gpuName().isEmpty() ? "non-Adreno GPU" : gpuName();
         boolean mali = gpuName().toLowerCase().contains("mali");
+        CheckBox hide = new CheckBox(act);
+        hide.setText("Don't show again");
+        int pad = Math.round(20 * act.getResources().getDisplayMetrics().density);
+        FrameLayout box = new FrameLayout(act);
+        box.setPadding(pad, pad / 2, pad, 0);
+        box.addView(hide);
         AlertDialog d = new AlertDialog.Builder(act)
                 .setTitle(mali ? "Mali support is in early stages" : "Your GPU is untested")
                 .setMessage(mali
@@ -157,8 +169,12 @@ final class Telemetry {
                         + "Somniel has only been tested on Qualcomm Adreno GPUs. Xclipse and other GPUs are untested and "
                         + "unverified: the game may show wrong graphics, run slowly, or not start at all.\n\n"
                         + "You can still try it. Reports from the in-game sidebar help us fix it.")
+                .setView(box)
                 .setCancelable(false)
-                .setPositiveButton("I understand", (di, w) -> { if (then != null) then.run(); })
+                .setPositiveButton("I understand", (di, w) -> {
+                    if (hide.isChecked()) prefs.edit().putBoolean("gpu_warning_hidden", true).apply();
+                    if (then != null) then.run();
+                })
                 .create();
         d.show();
     }

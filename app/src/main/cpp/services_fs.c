@@ -83,6 +83,10 @@ static void storage_handler(IpcObject *self, const IpcRequest *rq, IpcResponse *
         extern uint64_t g_fs_read_ns, g_fs_read_bytes, g_fs_read_calls;
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+        /* (Tried: on a small read into a 1 MB block not read before, read the whole block, since the game reads 16-96 KB
+         * pieces scattered over its bundles. No gain on the Galaxy Tab A11+: 3,708 against 3,402 ms of waiting over a
+         * battle-map load. In-app reads already run at the flash's speed (fs_bench: 861 MB/s sequential, 0.39 ms per
+         * random 32 KB read); the waiting is the game's ~6,300 one-at-a-time reads, and a 1 MB read costs ~3 random ones.) */
         while (done < size) {
             ssize_t n = pread(s->fd, dst + done, size - done, (off_t)(off + done));
             if (n <= 0) {
@@ -96,6 +100,20 @@ static void storage_handler(IpcObject *self, const IpcRequest *rq, IpcResponse *
         __atomic_fetch_add(&g_fs_read_ns, (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)), __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_fs_read_bytes, size, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_fs_read_calls, 1, __ATOMIC_RELAXED);
+        {   /* totals every 5 s while the game reads (for comparing loads) */
+            static pthread_mutex_t tm = PTHREAD_MUTEX_INITIALIZER;
+            static uint64_t t_log, n, bytes, ns;
+            uint64_t now = (uint64_t)t1.tv_sec * 1000000000ull + (uint64_t)t1.tv_nsec;
+            pthread_mutex_lock(&tm);
+            n++, bytes += size, ns += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+            if (!t_log) t_log = now;
+            if (now - t_log >= 5000000000ull) {
+                som_log("fs: %llu reads, %.1f MB, %.1f ms waiting (%.2f ms a read)", (unsigned long long)n,
+                        bytes / 1048576.0, ns / 1e6, ns / 1e6 / (double)n);
+                n = bytes = ns = 0, t_log = now;
+            }
+            pthread_mutex_unlock(&tm);
+        }
         return;
     }
     case 2: return; /* Flush */
@@ -122,6 +140,28 @@ static int open_romfs(IpcResponse *rs, const IpcRequest *rq) {
     s->fd = fd;
     s->size = (uint64_t)st.st_size;
     som_log("fs: serving RomFS image %s (%llu bytes)", path, (unsigned long long)s->size);
+    {   /* <data>/fs_bench: time the app's own reads of the image (1 GB on: sequential 1 MB, then random 32 KB) */
+        char bp[600];
+        snprintf(bp, sizeof bp, "%s/fs_bench", g_data_dir);
+        uint8_t *b = access(bp, F_OK) == 0 && s->size > (6ull << 30) ? malloc(1u << 20) : NULL;
+        if (b) {
+            struct timespec a, z;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            for (int i = 0; i < 256; i++) (void)!pread(fd, b, 1u << 20, (off_t)((1ull << 30) + ((uint64_t)i << 20)));
+            clock_gettime(CLOCK_MONOTONIC, &z);
+            double sq = (z.tv_sec - a.tv_sec) * 1e3 + (z.tv_nsec - a.tv_nsec) / 1e6;
+            uint64_t r = 0x9e3779b97f4a7c15ull;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            for (int i = 0; i < 1000; i++) {
+                r ^= r << 13, r ^= r >> 7, r ^= r << 17;
+                (void)!pread(fd, b, 32768, (off_t)((3ull << 30) + (r % (2ull << 30)) / 4096 * 4096));
+            }
+            clock_gettime(CLOCK_MONOTONIC, &z);
+            double rn = (z.tv_sec - a.tv_sec) * 1e3 + (z.tv_nsec - a.tv_nsec) / 1e6;
+            som_log("fs: bench: sequential 256 MB in %.0f ms (%.0f MB/s); 1000 random 32 KB reads in %.0f ms (%.2f ms each)", sq, 256e3 / sq, rn, rn / 1000);
+            free(b);
+        }
+    }
     ipc_return_object(rq, rs, "fs:romfs", storage_handler, s, storage_close);
     return 1;
 }

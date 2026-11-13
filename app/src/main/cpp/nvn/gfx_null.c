@@ -277,9 +277,72 @@ static void clr_set(uint64_t serial, const float *rgba) {
     memcpy(clr_tab[i].rgba, rgba, 16);
 }
 
+/* the shader-type tracker's part of an op (the shader keys depend on it) */
+static void ts_track(const op_hdr *h, const void *a) {
+    switch (h->op) {
+    case OP_BIND_PROGRAM: ts_bind_program(a); break;
+    case OP_BIND_VATTR: {
+        const p_bind_vattr *v = a;
+        for (int i = 0; i < 16; i++) {
+            uint32_t w = i < v->n ? v->st[i] : 0;
+            uint8_t ty = (uint8_t)(w ? fmt_type((int)(w & 0xff), 1) : 0);
+            if (ts.attr[(v->first + i) & 15] != ty) ts.attr[(v->first + i) & 15] = ty, ts_gen[ST_VS]++;
+        }
+        break;
+    }
+    case OP_BIND_TEX: ts_bind_handles(a, 0); break;
+    case OP_BIND_IMG: ts_bind_handles(a, 1); break;
+    case OP_SET_RT: {
+        const p_set_rt *r = a;
+        for (int i = 0; i < 8; i++) {
+            uint8_t ty = (uint8_t)(i < r->n && r->color[i] ? fmt_type(r->color[i]->d.format, 0) : 0);
+            if (ts.color_type[i] != ty) ts.color_type[i] = ty, ts_gen[ST_FS]++;
+        }
+        break;
+    }
+    default: break;
+    }
+}
+
+/* where the replay is (for the look-ahead) */
+static const uint64_t *rp_handles;
+static int rp_n, rp_i;
+static const op_hdr *rp_op;
+
+/* Look-ahead (vkr.c pipeline_for, in-frame compile mode): the rest of the submit after the current op is run through
+ * the renderer in scan mode, which only follows the state and queues the pipelines the draws will need. The tracker
+ * is put back afterwards, so the real replay goes on exactly as before. */
+void vkr_scan_begin(void);
+void vkr_scan_end(void);
+void gfx_scan_ahead(void) {
+    if (!rp_op || !rp_handles) return;
+    __typeof__(ts) ts_saved = ts;
+    uint32_t gen_saved[ST_N];
+    memcpy(gen_saved, ts_gen, sizeof ts_gen);
+    vkr_scan_begin();
+    const op_hdr *h = rp_op;
+    int i = rp_i;
+    for (;;) {
+        if (h->op == OP_END) {
+            if (++i >= rp_n) break;
+            h = nvn_op_first(rp_handles[i]);
+        } else {
+            h = nvn_op_next(h);
+        }
+        if (h->op == OP_END) continue;
+        const void *a = nvn_op_payload(h);
+        ts_track(h, a);
+        vkr_op(h, a);
+    }
+    vkr_scan_end();
+    ts = ts_saved;
+    memcpy(ts_gen, gen_saved, sizeof ts_gen);
+}
+
 static void null_replay(uint64_t handle) {
     for (const op_hdr *h = nvn_op_first(handle);; h = nvn_op_next(h)) {
         const void *a = nvn_op_payload(h);
+        rp_op = h;
         if (h->op < 64) __atomic_fetch_add(&op_hist[h->op], 1, __ATOMIC_RELAXED);
         uint64_t t0 = mono_now();
         vkr_op(h, a);
@@ -354,7 +417,9 @@ static uint64_t null_submit(const uint64_t *handles, int n) {
     uint64_t tb = mono_now();
     vkr_submit_begin();
     sub_begin_ns += mono_now() - tb;
-    for (int i = 0; i < n; i++) null_replay(handles[i]);
+    rp_handles = handles, rp_n = n;
+    for (int i = 0; i < n; i++) rp_i = i, null_replay(handles[i]);
+    rp_handles = NULL, rp_op = NULL;
     uint64_t te = mono_now();
     vkr_submit_end();
     sub_end_ns += mono_now() - te;

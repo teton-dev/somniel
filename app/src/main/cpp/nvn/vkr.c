@@ -213,6 +213,8 @@ static int ring_init1(void) {
     VK_CHECK(vkCreateBuffer(g_vkr.dev, &bi, NULL, &ring_buf));
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(g_vkr.dev, ring_buf, &mr);
+    /* (cached, non-coherent memory flushed before each submit was tried on the Galaxy Tab A11+, which has no cached
+     * coherent type: texture copies 0.44 -> 0.39 ms per MB, draw copies -0.2 ms, but the flush added ~0.5 ms a submit) */
     uint32_t t = find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (t == UINT32_MAX) return 0;
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, t};
@@ -1017,21 +1019,29 @@ static RpEnt *rps;
 /* clr: attachments whose old contents are replaced by a clear on load (pass_open). Load ops do not change render pass
  * compatibility, so pipelines and framebuffers are made with the clr = 0 pass and used with any variant. On a tiler a
  * LOAD reads the whole target from memory into the tile buffer; a CLEAR costs nothing. */
+static VkRenderPass rp_get_fmt(int n_color, const VkFormat *cf_in, VkFormat df, uint32_t clr);
 static VkRenderPass rp_get(uint32_t clr) {
     VkFormat cf[MAXI] = {0}, df = R.depth ? R.depth->fmt : VK_FORMAT_UNDEFINED;
     for (int i = 0; i < R.n_color; i++) cf[i] = R.color[i] ? R.color[i]->fmt : VK_FORMAT_UNDEFINED;
+    return rp_get_fmt(R.n_color, cf, df, clr);
+}
+
+/* the render pass for attachment formats (a pipeline recipe has formats, not images) */
+static VkRenderPass rp_get_fmt(int n_color, const VkFormat *cf_in, VkFormat df, uint32_t clr) {
+    VkFormat cf[MAXI] = {0};
+    for (int i = 0; i < n_color && i < MAXI; i++) cf[i] = cf_in[i];
     /* experiments (wrong pictures, for measuring what the tile loads and stores cost the GPU):
      * 131072 nothing is loaded, 262144 depth/stencil is not stored */
     int xf = vkr_flags() & (131072 | 262144);
     for (RpEnt *e = rps; e; e = e->next)
-        if (e->n == R.n_color && e->df == df && e->xf == xf && e->clr == clr && !memcmp(e->cf, cf, sizeof cf)) return e->rp;
+        if (e->n == n_color && e->df == df && e->xf == xf && e->clr == clr && !memcmp(e->cf, cf, sizeof cf)) return e->rp;
     VkAttachmentLoadOp lo = xf & 131072 ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
     VkAttachmentStoreOp dso = xf & 262144 ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
 #define LO(bit) ((clr >> (bit) & 1) ? VK_ATTACHMENT_LOAD_OP_CLEAR : lo)
     VkAttachmentDescription ad[MAXI + 1];
     VkAttachmentReference cr[MAXI], dr = {0};
     uint32_t na = 0;
-    for (int i = 0; i < R.n_color; i++) {
+    for (int i = 0; i < n_color; i++) {
         ad[na] = (VkAttachmentDescription){0, cf[i] ? cf[i] : VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, LO(i),
                                            VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
                                            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
@@ -1044,7 +1054,7 @@ static VkRenderPass rp_get(uint32_t clr) {
     }
     VkSubpassDescription sp = {0};
     sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sp.colorAttachmentCount = (uint32_t)R.n_color;
+    sp.colorAttachmentCount = (uint32_t)n_color;
     sp.pColorAttachments = cr;
     sp.pDepthStencilAttachment = df != VK_FORMAT_UNDEFINED ? &dr : NULL;
     VkRenderPassCreateInfo ri = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
@@ -1055,7 +1065,7 @@ static VkRenderPass rp_get(uint32_t clr) {
     RpEnt *e = calloc(1, sizeof *e);
     memcpy(e->cf, cf, sizeof cf);
     e->df = df;
-    e->n = R.n_color;
+    e->n = n_color;
     e->xf = xf;
     e->clr = clr;
     VK_CHECK(vkCreateRenderPass(g_vkr.dev, &ri, NULL, &e->rp));
@@ -1655,8 +1665,10 @@ static void *pcache_save_thread(void *arg) {
 }
 
 /* submit end: save once new pipelines have stopped coming for 3 s (on its own thread: the write takes a while) */
+static void rec_flush(void);
 static void pcache_tick(uint64_t now) {
     if (!g_pcache_new || g_pcache_saving || now - g_pcache_last < 3000000000ull) return;
+    rec_flush();
     g_pcache_new = 0;
     g_pcache_saving = 1;
     pthread_t th;
@@ -1793,11 +1805,12 @@ typedef struct PipeJob {
     VkGraphicsPipelineCreateInfo pi;
 } PipeJob;
 
-#define PIPE_WORKERS 3
+#define PIPE_WORKERS 4
 static int g_pipe_async = -1;
 static pthread_mutex_t pq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pq_cv = PTHREAD_COND_INITIALIZER;
 static PipeJob *pq_head, *pq_tail;
+static PipeJob *lq_head, *lq_tail; /* low priority: boot prebuild (taken only when nothing the game needs is queued) */
 static volatile int pq_busy; /* jobs queued or compiling */
 
 /* point the create info at the job's own copies (it was filled by value) and compile */
@@ -1834,10 +1847,17 @@ static void *pipe_worker(void *arg) {
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&pq_mu);
-        while (!pq_head) pthread_cond_wait(&pq_cv, &pq_mu);
-        PipeJob *j = pq_head;
-        pq_head = j->next;
-        if (!pq_head) pq_tail = NULL;
+        while (!pq_head && !lq_head) pthread_cond_wait(&pq_cv, &pq_mu);
+        PipeJob *j;
+        if (pq_head) {
+            j = pq_head;
+            pq_head = j->next;
+            if (!pq_head) pq_tail = NULL;
+        } else {
+            j = lq_head;
+            lq_head = j->next;
+            if (!lq_head) lq_tail = NULL;
+        }
         pthread_mutex_unlock(&pq_mu);
         uint64_t took;
         VkPipeline p = pipe_compile(j, &took);
@@ -1849,13 +1869,22 @@ static void *pipe_worker(void *arg) {
     return NULL;
 }
 
+static int g_pipe_workers; /* workers running (both modes: in-frame mode uses them for the look-ahead) */
 static int pipe_async_on(void) {
     if (g_pipe_async >= 0) return g_pipe_async;
     char p[600];
-    snprintf(p, sizeof p, "%s/sync_pipes", som_data_dir());
-    g_pipe_async = access(p, F_OK) != 0;
+    /* Background compiles leave a draw out until its pipeline is ready. On Mali GPUs compiles are slow enough that
+     * this showed: objects flickered, and when the game's final draw into the window texture was left out the picture
+     * from three frames back was shown (the camera jumped back while turning). Mali GPUs compile in the frame (a new
+     * pipeline is a short hitch instead, and the pipeline cache makes those rare); <data>/async_pipes overrides.
+     * Elsewhere background compiles as before; <data>/sync_pipes overrides. */
+    extern int som_gpu_is_mali(void);
+    int mali = som_gpu_is_mali();
+    snprintf(p, sizeof p, "%s/%s", som_data_dir(), mali ? "async_pipes" : "sync_pipes");
+    g_pipe_async = mali ? access(p, F_OK) == 0 : access(p, F_OK) != 0;
     int started = 0;
-    for (int i = 0; g_pipe_async && i < PIPE_WORKERS; i++) {
+    /* background mode (Adreno): 3 workers as before; in-frame mode (Mali): 4, for the look-ahead */
+    for (int i = 0; i < (g_pipe_async ? 3 : PIPE_WORKERS); i++) {
         pthread_t th;
         pthread_attr_t at;
         pthread_attr_init(&at);
@@ -1866,12 +1895,35 @@ static int pipe_async_on(void) {
         }
         pthread_attr_destroy(&at);
     }
+    g_pipe_workers = started;
     if (g_pipe_async && !started) g_pipe_async = 0;
-    som_log("vkr: pipelines compile %s", g_pipe_async ? "on background workers (draws wait for them; touch <data>/sync_pipes to compile in the frame)" : "in the frame");
+    som_log("vkr: pipelines compile %s", g_pipe_async ? "on background workers (a draw is left out until its pipeline is ready)" : "in the frame");
     return g_pipe_async;
 }
 
 static int g_pipe_late; /* set by pipeline_for when the pipeline exists but is still compiling */
+
+/* Look-ahead (in-frame compile mode). Pipelines were built one after another on the render thread as draws first needed
+ * them: a combat start on the Galaxy Tab A11+ (Mali-G615) needed 47 at once, 543 ms. At the first new pipeline of a
+ * submit, the rest of the submit is now scanned (gfx_scan_ahead, gfx_null.c: state changes only, nothing recorded) and
+ * every pipeline it will need is queued to the workers, which build them in parallel while the render thread goes on;
+ * a draw whose pipeline is still being built waits for it (never left out: in-frame mode is the one that does not skip). */
+static int g_pipe_queue;  /* set by scan_draw: a new pipeline goes to the workers and nothing waits for it */
+static int g_pipe_low;    /* with g_pipe_queue: to the low-priority queue (boot prebuild) */
+static int g_prebuilding; /* the pipeline comes from a recipe: not recorded again */
+static void rec_add(Shader *vs, Shader *fs, int prim, uint32_t used, int flags, int minus_w, uint64_t key);
+static void rec_open(void);
+static void prebuild_step(void);
+static int g_scan;        /* vkr_op is replaying a look-ahead scan: state only; draws only queue their pipelines */
+static int g_scan_done;   /* one look-ahead per submit (reset in vkr_submit_begin) */
+static unsigned g_scan_n, g_scan_queued; /* look-aheads and the pipelines they queued (logged with the slow submits) */
+extern void gfx_scan_ahead(void);        /* gfx_null.c */
+static void pipe_wait(PipeEnt *e) {      /* until a worker has built it */
+    while (__atomic_load_n(&e->pending, __ATOMIC_ACQUIRE)) {
+        struct timespec ts = {0, 100000};
+        nanosleep(&ts, NULL);
+    }
+}
 
 /* Pipeline for the current state and the two shaders; the key hashes everything that goes into it. */
 static VkPipeline pipeline_for(Shader *vs, Shader *fs, int prim, VkPipelineLayout layout, uint32_t used_streams) {
@@ -1892,8 +1944,14 @@ static VkPipeline pipeline_for(Shader *vs, Shader *fs, int prim, VkPipelineLayou
     for (PipeEnt *e = *bucket; e; e = e->next)
         if (e->key == h) {
             if (__atomic_load_n(&e->pending, __ATOMIC_ACQUIRE)) {
-                g_pipe_late = 1;
-                return VK_NULL_HANDLE;
+                if (g_pipe_queue) return VK_NULL_HANDLE; /* a scan: already on its way */
+                if (g_pipe_async) {
+                    g_pipe_late = 1;
+                    return VK_NULL_HANDLE;
+                }
+                PF_T0();
+                pipe_wait(e);
+                PS.t[PF_PIPE] += now_ns() - pf_t0_;
             }
             return __atomic_load_n(&e->p, __ATOMIC_ACQUIRE);
         }
@@ -2001,11 +2059,51 @@ static VkPipeline pipeline_for(Shader *vs, Shader *fs, int prim, VkPipelineLayou
     j->cb = cb, j->dy = dy, j->pi = pi;
     PipeEnt *e = calloc(1, sizeof *e);
     e->key = h;
+    if (!g_prebuilding) rec_add(vs, fs, prim, used_streams, flags, minus_w, h);
     VkPipeline p = VK_NULL_HANDLE;
     PF_T0();
     PS.n_pipe++;
     int queued = 0;
-    if (pipe_async_on()) {
+    int async = pipe_async_on(); /* also starts the workers */
+    if (!async && g_pipe_workers && (g_pipe_queue || !g_scan_done)) {
+        /* in-frame mode with workers: queue it; at the first new pipeline of a submit, look ahead and queue the
+         * submit's others too, then wait for this one */
+        e->pending = 1;
+        j->e = e;
+        e->next = *bucket;
+        *bucket = e;
+        __atomic_add_fetch(&pq_busy, 1, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&pq_mu);
+        if (g_pipe_low) {
+            if (lq_tail) lq_tail->next = j;
+            else lq_head = j;
+            lq_tail = j;
+        } else {
+            if (pq_tail) pq_tail->next = j;
+            else pq_head = j;
+            pq_tail = j;
+        }
+        pthread_cond_signal(&pq_cv);
+        pthread_mutex_unlock(&pq_mu);
+        if (g_pipe_queue) {
+            g_scan_queued++;
+            PS.t[PF_PIPE] += now_ns() - pf_t0_;
+            return VK_NULL_HANDLE;
+        }
+        g_scan_done = 1;
+        g_scan_n++;
+        PS.t[PF_PIPE] += now_ns() - pf_t0_;
+        unsigned q0 = g_scan_queued;
+        uint64_t s0 = now_ns();
+        gfx_scan_ahead();
+        if (g_scan_n <= 200)
+            som_log("vkr: look-ahead #%u queued %u more pipelines in %.2f ms", g_scan_n, g_scan_queued - q0, (double)(now_ns() - s0) / 1e6);
+        pf_t0_ = now_ns();
+        pipe_wait(e);
+        PS.t[PF_PIPE] += now_ns() - pf_t0_;
+        return __atomic_load_n(&e->p, __ATOMIC_ACQUIRE);
+    }
+    if (async) {
         /* already in the driver's cache: cheap, take it now (no pop-in for anything seen in an earlier run) */
         VkResult r = VK_PIPELINE_COMPILE_REQUIRED_EXT;
         /* even cache hits cost ~0.25 ms each and a new area can need a hundred at once: past 4 ms in this submit the
@@ -2129,6 +2227,9 @@ void vkr_tex_written(const tex_t *t) {
                 t->d.width, t->d.height, t->d.format, (void *)t->mem, sampled ? "was" : "never", total);
 }
 
+/* texture upload cost split (logged every 5 s while there are uploads): deswizzle, BC decode */
+static uint64_t g_tl_swz_ns, g_tl_bc_ns, g_tl_bytes, g_tl_levels, g_tl_log;
+
 /* upload a texture's storage the first time it is sampled, and again after the CPU rewrote it */
 static void img_load(Img *i) {
     if (i->loaded || i->is_rt) return;
@@ -2168,12 +2269,18 @@ static void img_load(Img *i) {
                 i->loaded = 0; /* the next submit starts with an empty ring */
                 goto done;
             }
+            uint64_t tl0 = now_ns();
+            g_tl_levels++, g_tl_bytes += up;
             if (!i->bc) {
                 if (nvn_deswizzle(d, level + i->drop, layer, t->mem, dst, row)) memset(dst, 0, sz);
+                g_tl_swz_ns += now_ns() - tl0;
             } else if (nvn_deswizzle(d, level + i->drop, layer, t->mem, bc_tmp, row)) {
                 memset(dst, 0, up);
             } else {
+                uint64_t tl1 = now_ns();
+                g_tl_swz_ns += tl1 - tl0;
                 bc_decode_level(i->bc, bc_tmp, row, w, h, dep, dst);
+                g_tl_bc_ns += now_ns() - tl1;
                 /* <data>/bc_dump: write the first decoded level 0 of up to 6 textures per BC format to <data>/bcdump/ for
                  * inspection on the PC (raw texels of the decoded format) */
                 static int dump_on = -1, dumped[256];
@@ -2199,6 +2306,14 @@ done:
     if (nr) vkCmdCopyBufferToImage(R.cb, ring_buf, i->image, VK_IMAGE_LAYOUT_GENERAL, nr, regs);
     barrier_all(R.cb);
     PF_T1(PF_TEX);
+    {
+        uint64_t now = now_ns();
+        if (now - g_tl_log >= 5000000000ull) {
+            som_log("vkr: texture uploads: %llu levels, %.1f MB, deswizzle %.1f ms, BC decode %.1f ms", (unsigned long long)g_tl_levels,
+                    g_tl_bytes / 1048576.0, g_tl_swz_ns / 1e6, g_tl_bc_ns / 1e6);
+            g_tl_levels = g_tl_bytes = g_tl_swz_ns = g_tl_bc_ns = 0, g_tl_log = now;
+        }
+    }
 }
 
 static uint64_t ubo_bytes(int st, int idx, VkBuffer *buf, uint64_t *off, uint64_t *range) {
@@ -2716,7 +2831,14 @@ static void do_draw_inner(int prim, int indexed, int count, int first, int base_
     VkPipeline pipe = lp.p;
     if (!pipe) {
         /* still compiling on a worker: leave this draw out (lp.p stays NULL, so the next draw asks again) */
-        if (g_pipe_late) { PS.n_late++, R.draws_skipped++; return; }
+        if (g_pipe_late) {
+            PS.n_late++, R.draws_skipped++;
+            if (R.n_color && R.color[0] && R.color[0]->presented) { /* the picture shown keeps an older frame here */
+                static unsigned nw;
+                if (nw++ < 10) som_log("vkr: draw into the window texture left out (pipeline still compiling)");
+            }
+            return;
+        }
         skip(__LINE__);
         return;
     }
@@ -3003,6 +3125,7 @@ void vkr_submit_begin(void) {
     pthread_mutex_lock(&submit_mu);
     if (nb == 1) R.depth_range[0] = 0.0f, R.depth_range[1] = 1.0f; /* NVN default; GPU state persists across submits */
     R.active = 1;
+    g_scan_done = 0;
     ring_off = 0;
     R.draws = R.draws_skipped = R.clears = 0;
     R.in_pass = 0;
@@ -3048,6 +3171,8 @@ void vkr_submit_begin(void) {
     cap_check();
     cmd_begin();
     gp_submit_begin();
+    if (submit_count == 1 && !pipe_async_on()) rec_open(); /* in-frame mode (Mali) only */
+    prebuild_step();
 }
 
 /* ---- profiler report */
@@ -3191,8 +3316,173 @@ void vkr_submit_end(void) {
     pthread_mutex_unlock(&submit_mu);
 }
 
+/* look-ahead draw: the pipeline this draw will need, worked out exactly as do_draw_inner does, queued to the workers */
+static void scan_draw(int prim) {
+    if (!R.n_color && !R.depth) return;
+    for (int i = 0; i < R.n_color; i++)
+        if (!R.color[i] || R.color[i]->drop) return;
+    R.rp = rp_get(0);
+    Shader *sh[2];
+    for (int s = 0; s < 2; s++) {
+        char key[40];
+        const uint8_t *ctl, *code;
+        uint32_t len;
+        if (!ts_shader_key(s, key, &ctl, &code, &len)) return;
+        sh[s] = shader_load(key, s, ts_stage_plain(s));
+        if (!sh[s] || sh[s]->unsupported) return;
+    }
+    if (prim == NVN_DRAW_PRIMITIVE_QUADS) prim = NVN_DRAW_PRIMITIVE_TRIANGLES;
+    if (topo_of(prim) == (VkPrimitiveTopology)-1) return;
+    uint32_t used = 0;
+    for (int l = 0; l < 16; l++) {
+        va_st a;
+        memcpy(&a, &R.vattr[l], sizeof a);
+        if (a.fmt && vtx_fmt((int)a.fmt) != VK_FORMAT_UNDEFINED) used |= 1u << a.stream;
+    }
+    g_pipe_queue = 1;
+    pipeline_for(sh[0], sh[1], prim, pl_get(sh[0]->layout, sh[1]->layout), used);
+    g_pipe_queue = 0;
+}
+
+static __typeof__(R) R_scan_saved;
+void vkr_scan_begin(void) { R_scan_saved = R, g_scan = 1; }
+void vkr_scan_end(void) { R = R_scan_saved, g_scan = 0; }
+
+/* ---- pipeline recipes and the boot prebuild (in-frame mode) ----
+ * Every new pipeline's recipe (the two shaders as resolved, primitive, vertex streams, the fixed-function state and the
+ * attachment formats) is appended to <data>/pipelines[.<driver>].rec. At the next launch the recipes are replayed a
+ * few at a time on the render thread (at most PREBUILD_BUDGET_NS a submit, from submit PREBUILD_FROM on): each sets
+ * the render state the way the draw did and queues its pipeline to the workers' low-priority queue, which they take
+ * only when nothing the game needs is waiting. A pipeline seen in any earlier session is then ready before the game
+ * first asks for it, with no shader setup or creation on the render thread at all. */
+typedef struct {
+    uint64_t key;
+    char vk[40], fk[40];
+    int32_t prim, n_color, flags, minus_w;
+    uint32_t used;
+    VkFormat cf[MAXI], df;
+    blend_st blend[8];
+    color_st cstate;
+    chmask_st chmask;
+    ms_st ms;
+    poly_st poly;
+    ds_st ds;
+    uint32_t vattr[16];
+    vs_st vstream[16];
+} PipeRec;
+#define REC_MAGIC 0x31435253u /* "SRC1" */
+#define PREBUILD_FROM 300
+#define PREBUILD_BUDGET_NS 2000000ull
+static FILE *g_rec_f;
+static PipeRec *g_recs;
+static size_t g_nrecs, g_rec_next;
+static int g_rec_state; /* 0 not opened, 1 open, -1 unavailable */
+static unsigned g_pb_queued, g_pb_skipped;
+static uint64_t g_pb_t0;
+
+static void rec_path(char *path, size_t cap) {
+    extern char g_gpu_driver_name[128];
+    if (g_gpu_driver_name[0]) snprintf(path, cap, "%s/pipelines.%s.rec", som_data_dir(), g_gpu_driver_name);
+    else snprintf(path, cap, "%s/pipelines.rec", som_data_dir());
+}
+
+/* read the recipes of earlier sessions and open the file for appending (a file from another build: started again) */
+static void rec_open(void) {
+    if (g_rec_state) return;
+    g_rec_state = -1;
+    char path[600];
+    rec_path(path, sizeof path);
+    uint32_t hdr[2] = {REC_MAGIC, (uint32_t)sizeof(PipeRec)};
+    FILE *f = fopen(path, "rb");
+    int fresh = 1;
+    if (f) {
+        uint32_t h[2];
+        if (fread(h, 1, sizeof h, f) == sizeof h && h[0] == hdr[0] && h[1] == hdr[1]) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f) - (long)sizeof h;
+            size_t n = sz > 0 ? (size_t)sz / sizeof(PipeRec) : 0;
+            fseek(f, (long)sizeof h, SEEK_SET);
+            if (n && (g_recs = malloc(n * sizeof(PipeRec)))) g_nrecs = fread(g_recs, sizeof(PipeRec), n, f);
+            fresh = 0;
+        }
+        fclose(f);
+    }
+    g_rec_f = fopen(path, fresh ? "wb" : "ab");
+    if (!g_rec_f) return;
+    if (fresh) fwrite(hdr, 1, sizeof hdr, g_rec_f), fflush(g_rec_f);
+    g_rec_state = 1;
+    som_log("vkr: pipeline recipes: %zu from earlier sessions%s", g_nrecs, fresh ? " (new file)" : "");
+}
+
+static void rec_add(Shader *vs, Shader *fs, int prim, uint32_t used, int flags, int minus_w, uint64_t key) {
+    if (g_pipe_async) return; /* in-frame mode only (Mali) */
+    rec_open();
+    if (g_rec_state != 1) return;
+    PipeRec r;
+    memset(&r, 0, sizeof r);
+    r.key = key;
+    memcpy(r.vk, vs->key, sizeof r.vk), memcpy(r.fk, fs->key, sizeof r.fk);
+    r.prim = prim, r.n_color = R.n_color, r.flags = flags, r.minus_w = minus_w, r.used = used;
+    for (int i = 0; i < R.n_color && i < MAXI; i++) r.cf[i] = R.color[i] ? R.color[i]->fmt : VK_FORMAT_UNDEFINED;
+    r.df = R.depth ? R.depth->fmt : VK_FORMAT_UNDEFINED;
+    memcpy(r.blend, R.blend, sizeof r.blend);
+    r.cstate = R.cstate, r.chmask = R.chmask, r.ms = R.ms, r.poly = R.poly, r.ds = R.ds;
+    memcpy(r.vattr, R.vattr, sizeof r.vattr), memcpy(r.vstream, R.vstream, sizeof r.vstream);
+    fwrite(&r, sizeof r, 1, g_rec_f);
+}
+
+static void rec_flush(void) { if (g_rec_f) fflush(g_rec_f); }
+
+/* a few recipes per submit: their pipelines to the workers' low-priority queue */
+static void prebuild_step(void) {
+    if (g_rec_next >= g_nrecs) return;
+    if (pipe_async_on() || !g_pipe_workers || submit_count < PREBUILD_FROM) return;
+    if (__atomic_load_n(&pq_busy, __ATOMIC_ACQUIRE) >= 2 * g_pipe_workers) return; /* the workers are busy enough */
+    if (!g_pb_t0) g_pb_t0 = now_ns(), som_log("vkr: prebuild: %zu pipeline recipes", g_nrecs - g_rec_next);
+    uint64_t t0 = now_ns();
+    int flags = vkr_flags(), minus_w = nvn_depth_minus_w();
+    R_scan_saved = R;
+    g_prebuilding = g_pipe_queue = g_pipe_low = 1;
+    while (g_rec_next < g_nrecs && now_ns() - t0 < PREBUILD_BUDGET_NS && __atomic_load_n(&pq_busy, __ATOMIC_ACQUIRE) < 4 * g_pipe_workers) {
+        const PipeRec *r = &g_recs[g_rec_next++];
+        if (r->flags != flags || r->minus_w != minus_w || r->n_color < 0 || r->n_color > MAXI) { g_pb_skipped++; continue; }
+        Shader *vs = shader_load1(r->vk, 0), *fs = shader_load1(r->fk, 1);
+        if (!vs || !fs || vs->unsupported || fs->unsupported) { g_pb_skipped++; continue; }
+        memcpy(R.blend, r->blend, sizeof R.blend);
+        R.cstate = r->cstate, R.chmask = r->chmask, R.ms = r->ms, R.poly = r->poly, R.ds = r->ds;
+        memcpy(R.vattr, r->vattr, sizeof R.vattr), memcpy(R.vstream, r->vstream, sizeof R.vstream);
+        R.n_color = r->n_color;
+        R.rp = rp_get_fmt(r->n_color, r->cf, r->df, 0);
+        unsigned q0 = g_scan_queued;
+        pipeline_for(vs, fs, r->prim, pl_get(vs->layout, fs->layout), r->used);
+        g_pb_queued += g_scan_queued - q0;
+    }
+    g_prebuilding = g_pipe_queue = g_pipe_low = 0;
+    R = R_scan_saved;
+    if (g_rec_next >= g_nrecs)
+        som_log("vkr: prebuild done: %u pipelines queued, %u already made, %u skipped, %.1f s", g_pb_queued,
+                (unsigned)(g_nrecs - g_pb_queued - g_pb_skipped), g_pb_skipped, (double)(now_ns() - g_pb_t0) / 1e9);
+}
+
 void vkr_op(const op_hdr *h, const void *a) {
     if (!R.active) return;
+    if (g_scan) { /* look-ahead: state changes only; nothing is recorded, nothing in memory changes */
+        switch (h->op) {
+        case OP_SET_RT: {
+            const p_set_rt *r = a;
+            R.pgen++;
+            R.n_color = r->n > MAXI ? MAXI : r->n;
+            for (int i = 0; i < R.n_color; i++) R.color[i] = r->color[i] ? img_get(r->color[i]) : NULL;
+            R.depth = r->depth ? img_get(r->depth) : NULL;
+            return;
+        }
+        case OP_DRAW: scan_draw(((const p_draw *)a)->prim); return;
+        case OP_DRAW_IDX: scan_draw(((const p_draw_idx *)a)->prim); return;
+        case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_COPY_B2T:
+        case OP_COPY_T2T: return;
+        default: break; /* the binds below only set R */
+        }
+    }
     if ((vkr_flags() & 8) && h->op != OP_DRAW && h->op != OP_DRAW_IDX && h->op != OP_BIND_TEX && h->op != OP_BIND_SAMP &&
         h->op != OP_BIND_STATE && h->op != OP_BIND_UBO && h->op != OP_BIND_VBUF && h->op != OP_BIND_VATTR &&
         h->op != OP_BIND_VSTREAM && h->op != OP_BIND_PROGRAM && h->op != OP_STENCIL && h->op != OP_POLY_OFFSET &&

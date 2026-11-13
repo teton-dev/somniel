@@ -484,13 +484,22 @@ static bool draw_frame(Gfx *g, double t) {
     sub.signalSemaphoreCount = 1;
     sub.pSignalSemaphores = &g->render_done[idx];
     static uint64_t wl_sub_ns, wl_pres_ns, wl_n, wl_t0;
-    struct timespec wa, wb, wc;
+    struct timespec wa, wb, wc, wp;
     clock_gettime(CLOCK_MONOTONIC, &wa);
     pthread_mutex_lock(&g_vkr.qmu);
     VkResult sr = vkQueueSubmit(g->queue, 1, &sub, g->fence[f]);
     pthread_mutex_unlock(&g_vkr.qmu);
     clock_gettime(CLOCK_MONOTONIC, &wb);
     if (!vk_ok(sr, "vkQueueSubmit")) return false;
+    {   /* Mali: wait for the copy to finish before presenting, without the queue lock. The Mali driver otherwise waits
+         * for it inside vkQueuePresentKHR (20-27 ms on the Galaxy Tab A11+) with the lock held; the next copy queued late
+         * and frames reached the screen in pairs, one refresh apart, then a long gap. Adreno: unchanged. */
+        extern int som_gpu_is_mali(void);
+        static int wait_copy = -1;
+        if (wait_copy < 0) wait_copy = som_gpu_is_mali();
+        if (g_spike_mode && wait_copy) vkWaitForFences(g->dev, 1, &g->fence[f], VK_TRUE, 200000000ull);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &wp);
 
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
@@ -505,7 +514,8 @@ static bool draw_frame(Gfx *g, double t) {
     {   /* how long the window thread holds the queue lock (the renderer's submit waits for it) */
         uint64_t a = (uint64_t)wa.tv_sec * 1000000000ull + (uint64_t)wa.tv_nsec, b = (uint64_t)wb.tv_sec * 1000000000ull + (uint64_t)wb.tv_nsec;
         uint64_t cc = (uint64_t)wc.tv_sec * 1000000000ull + (uint64_t)wc.tv_nsec;
-        wl_sub_ns += b - a, wl_pres_ns += cc - b, wl_n++;
+        uint64_t pp = (uint64_t)wp.tv_sec * 1000000000ull + (uint64_t)wp.tv_nsec;
+        wl_sub_ns += b - a, wl_pres_ns += cc - pp, wl_n++;
         if (!wl_t0) wl_t0 = cc;
         if (cc - wl_t0 >= 5000000000ull) {
             som_log("window: %.1f presents/s, queue lock held per present: submit %.2f ms, present %.2f ms", wl_n / ((cc - wl_t0) / 1e9),

@@ -279,6 +279,10 @@ void kthread_check_pause(void) {
 extern uint64_t g_gc_pauses, g_gc_pause_ns;
 static int g_npaused;
 static struct timespec g_world_stop;
+/* per stop-the-world: threads paused, time spent getting each one to acknowledge (sum, worst), logged at the release */
+static uint64_t g_ws_ack_sum, g_ws_ack_max;
+static int g_ws_threads, g_ws_cpu0;
+static uint64_t ts_ns(const struct timespec *t) { return (uint64_t)t->tv_sec * 1000000000ull + (uint64_t)t->tv_nsec; }
 
 uint32_t kthread_set_activity(uint32_t handle, uint32_t activity) {
     KThread *t = handle == HANDLE_CUR_THREAD ? t_thread : kobj_get(handle, KO_THREAD);
@@ -303,8 +307,9 @@ uint32_t kthread_set_activity(uint32_t handle, uint32_t activity) {
         /* wait for the acknowledgement (in 2 ms slices, then give up after 5 s). This thread may itself be paused
          * meanwhile: its own handler only snapshots and returns here (it is in host code), and it parks at its next
          * return to the guest. */
-        struct timespec dl, m;
+        struct timespec dl, m, a0;
         clock_gettime(CLOCK_MONOTONIC, &dl);
+        a0 = dl;
         dl.tv_sec += 5;
         while (!__atomic_load_n(&t->paused, __ATOMIC_ACQUIRE)) {
             fwait(&t->paused, 0, 2000000);
@@ -314,10 +319,15 @@ uint32_t kthread_set_activity(uint32_t handle, uint32_t activity) {
                 break;
             }
         }
+        clock_gettime(CLOCK_MONOTONIC, &m);
+        uint64_t ack = ts_ns(&m) - ts_ns(&a0);
         if (__atomic_fetch_add(&g_npaused, 1, __ATOMIC_ACQ_REL) == 0) {
-            clock_gettime(CLOCK_MONOTONIC, &g_world_stop);
+            g_world_stop = a0;
             __atomic_fetch_add(&g_gc_pauses, 1, __ATOMIC_RELAXED);
+            g_ws_ack_sum = g_ws_ack_max = 0, g_ws_threads = 0, g_ws_cpu0 = sched_getcpu();
         }
+        g_ws_ack_sum += ack, g_ws_threads++;
+        if (ack > g_ws_ack_max) g_ws_ack_max = ack;
         __atomic_sub_fetch(&stoppers, 1, __ATOMIC_SEQ_CST);
         return RES_OK;
     }
@@ -326,7 +336,12 @@ uint32_t kthread_set_activity(uint32_t handle, uint32_t activity) {
     if (__atomic_sub_fetch(&g_npaused, 1, __ATOMIC_ACQ_REL) == 0) { /* the collector let the last thread go */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        __atomic_fetch_add(&g_gc_pause_ns, (uint64_t)((now.tv_sec - g_world_stop.tv_sec) * 1000000000ll + (now.tv_nsec - g_world_stop.tv_nsec)), __ATOMIC_RELAXED);
+        uint64_t stopped = (uint64_t)((now.tv_sec - g_world_stop.tv_sec) * 1000000000ll + (now.tv_nsec - g_world_stop.tv_nsec));
+        __atomic_fetch_add(&g_gc_pause_ns, stopped, __ATOMIC_RELAXED);
+        static unsigned nlog;
+        if (stopped > 10000000ull && nlog++ < 100)
+            som_log("gc: world stopped %.1f ms: %d threads paused, acknowledging took %.1f ms in all (worst %.2f ms); collector on CPU %d at the start, %d at the end",
+                    stopped / 1e6, g_ws_threads, g_ws_ack_sum / 1e6, g_ws_ack_max / 1e6, g_ws_cpu0, sched_getcpu());
     }
     __atomic_store_n(&t->ctx_valid, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&t->paused, 0, __ATOMIC_RELEASE);
