@@ -60,6 +60,12 @@ static const uint8_t kMainBuildId[16] = {0x8c, 0x08, 0xb9, 0x71, 0x9e, 0x08, 0x5
  * went from 10.8% to 5.0% of the GPU frame on the Galaxy A17 (2026-11-12). The Anti-aliasing option (GFX_AA) sets the
  * mode to None (0) just before the read. */
 #define RVA_FINAL_AA     0x0319880cu
+/* PostProcessPass.Render reads the same field (`ldr w8, [x20, #0x144]`, x20 = CameraData) before the final pass: at
+ * 0x0319aeb4 (mode 4) and at 0x0319b9d0 for SMAA (mode 2: edge detection, blend weights and neighbourhood blending as
+ * three passes of their own). The Somniel hub uses SMAA, so clearing the field only at the final pass left its
+ * anti-aliasing on. Clearing it at the first read covers both, and the final pass then reads None too. */
+#define RVA_PP_AA_MODE4  0x0319aeb4u
+#define RVA_PP_AA_SMAA   0x0319b9d0u
 #define RVA_RT_GET_W     0x02f84a20u /* RenderTexture.get_width (called) */
 #define RVA_RT_SET_W     0x02f84a70u /* RenderTexture.set_width (called) */
 #define RVA_RT_GET_H     0x02f84ac0u /* RenderTexture.get_height (called) */
@@ -72,6 +78,7 @@ static const Site kSites[] = {
     {RVA_SET_VSYNC, 0x2a0003f3},   {RVA_SET_SCALE, 0xfc1d0fe8},   {RVA_GMAP_MOVE, 0x6dbd23e9},
     {RVA_SET_LODBIAS, 0xfc1e0fe8}, {RVA_SET_MAXLOD, 0xa9be7bfd},  {RVA_GET_RPASSET, 0xa9be7bfd},
     {RVA_OFFSCREEN_RENDER, 0xaa1303e0}, {RVA_FINAL_AA, 0xb9414688},
+    {RVA_PP_AA_MODE4, 0xb9414688}, {RVA_PP_AA_SMAA, 0xb9414688},
     /* HubUtil params getters: ldr s0, [x0, #off]; the hook sits on the instruction after it (an ldp) */
     {0x02a5e870, 0xbd402000}, {0x02a5e874, 0xa9414ff4}, {0x02a5e8d0, 0xbd402400}, {0x02a5e8d4, 0xa9414ff4},
     {0x02a5e930, 0xbd402800}, {0x02a5e934, 0xa9414ff4}, {0x02a5e990, 0xbd402c00}, {0x02a5e994, 0xa9414ff4},
@@ -125,17 +132,20 @@ int som_target_fps(void) { return game_fps60_on ? g_fps : 0; }
  *              (hooks_system.c) the first time it is asked: next launch.
  * GFX_TEXSIZE  Texture size: 0 Full, 1 Half, 2 Quarter: large sampled textures lose their top mip levels (less
  *              memory and texture bandwidth). Read when images are made (vkr.c): next launch.
- * GFX_AA       Anti-aliasing (the final pass's FXAA): 0 On (the game's own), 1 Off. Applied at once (on_final_aa).
+ * GFX_AA       Anti-aliasing (FXAA in the final pass, SMAA before it): 0 On (the game's own), 1 Off. Applied at once (on_final_aa).
  * GFX_ASPECT   Aspect ratio: 0 Stretch to fill the screen, 1 16:9 (the picture's own shape, centred, black bars).
- *              Applied at once (vkr_blit_present, main.c). */
+ *              Applied at once (vkr_blit_present, main.c).
+ * GFX_CULL     Occlusion culling: 0 Auto (on for Mali GPUs: faster there; on the RP6's Adreno it cost ~4 fps), 1 On, 2 Off.
+ *              Applied within 2 s (vkr.c cull_submit_begin). */
 enum { GFX_SHADOWS = 0, GFX_MODEL = 1, GFX_TEXBIAS = 2, GFX_SHADERS = 3, GFX_PROFILE = 4, GFX_TEXSIZE = 5, GFX_AA = 6, GFX_ASPECT = 7,
-       GFX_N = 8 };
+       GFX_CULL = 8, GFX_N = 9 };
 static volatile int g_gfx[GFX_N];
 
 void som_set_graphics(int key, int v) {
-    static const char *names[] = {"shadows", "model detail", "texture sharpness", "shader precision", "console mode", "texture size", "anti-aliasing", "aspect ratio"};
+    static const char *names[] = {"shadows", "model detail", "texture sharpness", "shader precision", "console mode", "texture size", "anti-aliasing", "aspect ratio",
+                                  "occlusion culling"};
     if (key < 0 || key >= GFX_N || v < 0 || v > 3) return;
-    if (g_gfx[key] != v && key < 8) som_log("settings: %s %d", names[key], v);
+    if (g_gfx[key] != v) som_log("settings: %s %d", names[key], v);
     g_gfx[key] = v;
 }
 
@@ -150,6 +160,9 @@ int som_shader_precision(void) { return g_gfx[GFX_SHADERS]; }
 
 /* the Console mode choice: 0 Auto, 1 Handheld, 2 Docked (hooks_system.c) */
 int som_profile_choice(void) { return g_gfx[GFX_PROFILE]; }
+
+/* the Occlusion culling choice: 0 Auto, 1 On, 2 Off (vkr.c) */
+int som_cull_choice(void) { return g_gfx[GFX_CULL]; }
 
 /* the Texture size choice: top mip levels to leave out, 0 to 2 (vkr.c) */
 int som_tex_size(void) { return g_gfx[GFX_TEXSIZE]; }
@@ -317,6 +330,15 @@ static void on_final_aa(GuestCtx *c) {
     if (off) *pv = 0;
 }
 
+/* PostProcessPass.Render about to read CameraData.antialiasing: None when the option says off (SMAA, mode 4) */
+static void on_pp_aa(GuestCtx *c) {
+    int32_t *pv = (int32_t *)(uintptr_t)(c->x[20] + 0x144);
+    static unsigned seen;
+    int v = *pv;
+    if (v >= 0 && v < 32 && !(seen >> v & 1)) seen |= 1u << v, som_log("graphics: post-processing has anti-aliasing mode %d", v);
+    if (g_gfx[GFX_AA] == 1) *pv = 0;
+}
+
 /* HubUtil.Params getters, after the load: s0 holds the value */
 static void on_hub_linear(GuestCtx *c) { set_float(c, 0, get_float(c, 0) * (30.0f / (float)g_fps)); }
 static void on_hub_accel(GuestCtx *c) {
@@ -359,6 +381,8 @@ void game_patches_apply(const NsoModule *mods, int nmods, Island *isl, int nisl)
     ok &= hook_site(b + RVA_SET_LODBIAS, "QualitySettings.set_lodBias", on_set_lodbias, 0, isl, nisl);
     ok &= hook_site(b + RVA_OFFSCREEN_RENDER, "CustomOffscreenCamera.CustomBeginFrameRendering", on_offscreen_render, 0, isl, nisl);
     ok &= hook_site(b + RVA_FINAL_AA, "PostProcessPass.RenderFinalPass antialiasing", on_final_aa, 0, isl, nisl);
+    ok &= hook_site(b + RVA_PP_AA_MODE4, "PostProcessPass.Render antialiasing (mode 4)", on_pp_aa, 0, isl, nisl);
+    ok &= hook_site(b + RVA_PP_AA_SMAA, "PostProcessPass.Render antialiasing (SMAA)", on_pp_aa, 0, isl, nisl);
     game_fps60_on = ok;
     som_log("patches: frame rate and render scale hooks %s (%d fps, %d%%)", ok ? "installed" : "FAILED (no island space?)", g_fps,
             g_scale_pct);

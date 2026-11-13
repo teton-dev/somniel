@@ -38,6 +38,7 @@ final class Sidebar {
         {7, "gfx_aspect", "Aspect ratio", new String[] {"Stretch to fill", "16:9"}},
         {0, "gfx_shadows", "Shadows", new String[] {"High", "Medium", "Low", "Off"}},
         {6, "gfx_fxaa", "Anti-aliasing", new String[] {"On", "Off"}},
+        {8, "gfx_cull", "Hidden object culling", new String[] {"Auto", "On", "Off"}},
         {2, "gfx_texbias", "Texture sharpness", new String[] {"Normal", "Softer (after restart)", "Soft (after restart)"}},
         {5, "gfx_texsize", "Texture size", new String[] {"Full", "Half (after restart)", "Quarter (after restart)"}},
         {3, "gfx_shaders", "Shader precision", new String[] {"Accurate", "Fast (after restart)", "Fastest, experimental: some text breaks (after restart)"}},
@@ -810,7 +811,8 @@ final class Sidebar {
         graphicsPage.addView(back);
         TextView note = text("Lower settings trade picture quality for speed. Options marked \"after restart\" "
                 + "take effect the next time the game starts. Console mode Auto: handheld on Mali GPUs, docked elsewhere. "
-                + "Anti-aliasing Off is faster on Mali GPUs.", 14, false);
+                + "Anti-aliasing Off is faster on Mali GPUs. Hidden object culling skips objects that are fully behind "
+                + "walls; Auto: on for Mali GPUs (faster there), off elsewhere.", 14, false);
         note.setTextColor(0xFFB0B8CC);
         note.setPadding(px(20), px(14), px(20), px(6));
         graphicsPage.addView(note);

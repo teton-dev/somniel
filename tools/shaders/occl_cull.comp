@@ -1,0 +1,19 @@
+#version 450
+// Occlusion culling (vkr.c): one invocation per culled-draw job. Words are indexes into the frame's upload ring.
+// vis[q]: occlusion query q's result (0 = no sample passed). A job lists up to 4 queries (0xffffffff = none) of
+// earlier draws of the same object on the same depth buffer; the draw's instance count stays as written by the CPU
+// unless every listed query saw nothing, then it becomes 0.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Ring { uint w[]; };
+layout(push_constant) uniform P { uint vis; uint jobs; uint njobs_word; uint pad; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= w[pc.njobs_word]) return;
+    uint j = pc.jobs + i * 6u;   // arg word, instances, 4 queries
+    bool seen = false;
+    for (uint k = 0u; k < 4u; k++) {
+        uint q = w[j + 2u + k];
+        if (q != 0xffffffffu && w[pc.vis + q] != 0u) seen = true;
+    }
+    w[w[j]] = seen ? w[j + 1u] : 0u;
+}

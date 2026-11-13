@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -121,6 +122,10 @@ static uint64_t pf_begin; /* start of this submit */
 /* <data>/vkr_skip_pass: "N" or "LO HI": pass indices (as the GPU pass timing numbers them) whose draws are left out
  * (-2 every pass, -3 the passes into a presented window image, absent -1): measures what a pass really costs on a GPU whose per-pass timestamps overlap (Mali). */
 static int g_skip_pass = -1, g_skip_hi = -1, pass_no = -1;
+/* optional 3rd/4th numbers in vkr_skip_pass: only the draws with these indices inside the pass are left out; a 3rd
+ * number of -9 leaves nothing out and logs the draws of pass LO once ("vkr: pass N draw i: ...") */
+static int g_skip_dlo = -1, g_skip_dhi = -1;
+static uint64_t pass_draw0; /* R.draws when the current pass began */
 static int flags_cur = -1;
 static int flags_refresh(void) {
     static int f = -1;
@@ -139,14 +144,15 @@ static int flags_refresh(void) {
         if (v != f) som_log("vkr: flags %d", v);
         f = v;
         snprintf(path, sizeof path, "%s/vkr_skip_pass", som_data_dir());
-        int sp = -1, hi = -1;
+        int sp = -1, hi = -1, dlo = -1, dhi = -1;
         if ((fp = fopen(path, "r"))) {
-            if (fscanf(fp, "%d %d", &sp, &hi) < 1) sp = -1;
+            if (fscanf(fp, "%d %d %d %d", &sp, &hi, &dlo, &dhi) < 1) sp = -1;
             fclose(fp);
         }
         if (hi < sp) hi = sp;
-        if (sp != g_skip_pass || hi != g_skip_hi) som_log("vkr: skip pass %d-%d", sp, hi);
-        g_skip_pass = sp, g_skip_hi = hi;
+        if (dhi < dlo) dhi = dlo;
+        if (sp != g_skip_pass || hi != g_skip_hi || dlo != g_skip_dlo || dhi != g_skip_dhi) som_log("vkr: skip pass %d-%d draws %d-%d", sp, hi, dlo, dhi);
+        g_skip_pass = sp, g_skip_hi = hi, g_skip_dlo = dlo, g_skip_dhi = dhi;
     }
     return flags_cur = f;
 }
@@ -209,7 +215,8 @@ static int ring_init1(void) {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = RING_BYTES;
     bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     VK_CHECK(vkCreateBuffer(g_vkr.dev, &bi, NULL, &ring_buf));
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(g_vkr.dev, ring_buf, &mr);
@@ -289,6 +296,8 @@ typedef struct Img {
     VkComponentMapping comp; /* the texture's own swizzle, as in view */
     uint32_t drop; /* top mip levels left out (Texture size option): image level L is the texture's level L + drop */
     uint64_t bytes;
+    uint32_t dgen; /* occlusion culling: bumped when the depth contents may move away (clear, copy, other writes) */
+    int ddir;      /* the compare direction depth writes have used since (1 less, 2 greater, 0 none yet) */
     struct Img *next;
 } Img;
 
@@ -1372,6 +1381,351 @@ static void gp_report(void) {
     memset(&GW, 0, sizeof GW);
 }
 
+
+/* ---- debug: how many draws of a pass leave no visible pixel (<data>/vkr_occl holds the pass number, re-read every
+ * 2 s). Every 5 s one submit puts an occlusion query around each draw of that pass; when its fence has passed, a
+ * summary is logged ("vkr: occlusion pass N: ..."): draws with no sample passing the depth/stencil test (off screen,
+ * or hidden behind what was drawn before them, the depth pre-pass included) and with very few. */
+#define OQ_MAX 4096
+typedef struct { char vk[17], fk[17]; uint32_t count, inst, idx; } OqMeta;
+static struct {
+    VkQueryPool qp;
+    int on;
+    uint32_t n;
+    OqMeta m[OQ_MAX];
+} OQ[NFRAME];
+static int oq_pass = -1, oq_cur;
+static uint64_t oq_next, oq_next_read;
+static void oq_submit_begin(void) {
+    uint64_t now = now_ns();
+    OQ[fr_cur].on = 0;
+    if (now >= oq_next_read) {
+        oq_next_read = now + 2000000000ull;
+        char path[600];
+        snprintf(path, sizeof path, "%s/vkr_occl", som_data_dir());
+        FILE *f = fopen(path, "r");
+        int v = -1;
+        if (f) {
+            if (fscanf(f, "%d", &v) != 1) v = -1;
+            fclose(f);
+        }
+        if (v != oq_pass) som_log("vkr: occlusion counting %s %d", v >= 0 ? "on, pass" : "off", v);
+        oq_pass = v;
+    }
+    if (oq_pass < 0 || now < oq_next) return;
+    if (!OQ[fr_cur].qp) {
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qi.queryCount = OQ_MAX;
+        if (vkCreateQueryPool(g_vkr.dev, &qi, NULL, &OQ[fr_cur].qp) != VK_SUCCESS) return;
+    }
+    vkCmdResetQueryPool(R.cb, OQ[fr_cur].qp, 0, OQ_MAX);
+    OQ[fr_cur].on = 1, OQ[fr_cur].n = 0;
+    oq_next = now + 5000000000ull;
+}
+/* around one draw's vkCmdDraw*: the draw's index inside its pass */
+static int cull_active(void);
+static void oq_begin(const char *vk, const char *fk, uint32_t count, uint32_t inst, uint32_t idx) {
+    oq_cur = -1;
+    if (cull_active()) return; /* one occlusion query at a time: culling has its own */
+    if (!OQ[fr_cur].on || pass_no != oq_pass || OQ[fr_cur].n >= OQ_MAX) return;
+    oq_cur = (int)OQ[fr_cur].n++;
+    OqMeta *m = &OQ[fr_cur].m[oq_cur];
+    memcpy(m->vk, vk, 16), memcpy(m->fk, fk, 16);
+    m->vk[16] = m->fk[16] = 0;
+    m->count = count, m->inst = inst, m->idx = idx;
+    vkCmdBeginQuery(R.cb, OQ[fr_cur].qp, (uint32_t)oq_cur, 0);
+}
+static void oq_end(void) {
+    if (oq_cur >= 0) vkCmdEndQuery(R.cb, OQ[fr_cur].qp, (uint32_t)oq_cur);
+    oq_cur = -1;
+}
+/* after FR[fr_cur]'s fence */
+static void oq_collect(void) {
+    if (!OQ[fr_cur].on || !OQ[fr_cur].n) return;
+    OQ[fr_cur].on = 0;
+    uint32_t n = OQ[fr_cur].n;
+    static uint64_t res[OQ_MAX];
+    if (vkGetQueryPoolResults(g_vkr.dev, OQ[fr_cur].qp, 0, n, sizeof res, res, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    uint32_t zero = 0, tiny = 0;
+    uint64_t verts = 0, zverts = 0, tverts = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t v = (uint64_t)OQ[fr_cur].m[i].count * OQ[fr_cur].m[i].inst;
+        verts += v;
+        if (res[i] == 0) zero++, zverts += v;
+        else if (res[i] < 64) tiny++, tverts += v;
+    }
+    som_log("vkr: occlusion pass %d: %u draws (%llu vertices); no pixel %u (%llu vertices), under 64 pixels %u (%llu vertices)",
+            oq_pass, n, (unsigned long long)verts, zero, (unsigned long long)zverts, tiny, (unsigned long long)tverts);
+    for (uint32_t i = 0; i < n; i++) {
+        const OqMeta *m = &OQ[fr_cur].m[i];
+        som_log("vkr: occl %d draw %u: %llu px vs %s fs %s count %u inst %u", oq_pass, m->idx, (unsigned long long)res[i], m->vk, m->fk, m->count, m->inst);
+    }
+}
+
+/* ---- occlusion culling (Graphics page "Hidden object culling": Auto = Mali GPUs only, On, Off; <data>/occl_cull
+ * "0"/"1" overrides it for testing; both looked at every 2 s)
+ * The game draws most objects twice: a depth pre-pass, then the shaded pass with depth test EQUAL. In the Somniel
+ * shops ~85% of the shaded draws produce no pixel (behind walls; the game has no occlusion culling of its own), and
+ * their vertex work kept the Galaxy Tab A11+ at 27-28 fps there; leaving them out reached the 30 fps cap.
+ * Each draw that writes depth with a less/greater test gets an occlusion query (a "producer"). A later draw of the
+ * same object (same mesh and draw range, and the producer's object-to-world matrix found in its own vertex-stage
+ * constants) on the same depth image, with no clear, copy or other kind of depth write in between, cannot pass a
+ * depth test its earlier draw failed everywhere. When a render pass begins, the query results so far are copied to
+ * the ring and a small compute shader (tools/shaders/occl_cull.comp) sets the instance count of such draws, which are
+ * recorded as indirect draws, to 0 when all their producers saw nothing. All on the GPU, in the same frame: no pop-in,
+ * no wait. Anything not matched exactly is drawn as before. */
+#include "occl_cull_spv.h"
+#define CQ_MAX 4096 /* queries (producers) per submit */
+#define CJ_MAX 2048 /* conditional draws per pass */
+typedef struct { uint64_t mesh, vpk, dimg, bias; uint32_t dgen, q; int df; uint8_t mat[64]; } CProd;
+static CProd cprod[CQ_MAX];
+static uint32_t cprod_n, cprod_head[1024], cprod_next[CQ_MAX];
+static VkQueryPool cq_pool[NFRAME];
+static int cull_on, cull_want = -1, cull_broken, cull_first_inst;
+static uint64_t cull_next_read;
+static VkPipeline cull_pipe;
+static VkPipelineLayout cull_pl;
+static VkDescriptorSetLayout cull_dsl;
+static VkDescriptorPool cull_dp;
+static VkDescriptorSet cull_set[NFRAME];
+static VkBuffer cull_set_buf[NFRAME];
+static int cpass_ok; /* this pass has a job list */
+static uint32_t cpass_q0, cpass_jobs_w, *cpass_n, *cpass_jobs;
+static uint64_t cpass_dimg;
+static uint64_t cst_prod, cst_cond, cst_sub, cst_t, cst_kept;
+static int cull_active(void) { return cull_on; }
+
+static int cull_init(void) {
+    if (cull_pipe) return 1;
+    if (cull_broken) return 0;
+    cull_broken = 1;
+    VkPhysicalDeviceFeatures pf;
+    vkGetPhysicalDeviceFeatures(g_vkr.phys, &pf);
+    cull_first_inst = pf.drawIndirectFirstInstance;
+    VkPhysicalDeviceProperties pp;
+    vkGetPhysicalDeviceProperties(g_vkr.phys, &pp);
+    if (pp.limits.maxStorageBufferRange < RING_BYTES) {
+        som_log("vkr: occlusion culling off: storage buffers reach %u bytes, the ring is %u", pp.limits.maxStorageBufferRange, (unsigned)RING_BYTES);
+        return 0;
+    }
+    VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof occl_cull_spv, occl_cull_spv};
+    VkShaderModule m;
+    if (vkCreateShaderModule(g_vkr.dev, &mi, NULL, &m) != VK_SUCCESS) return 0;
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NFRAME};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, NFRAME, 1, &ps};
+    if (vkCreateDescriptorSetLayout(g_vkr.dev, &li, NULL, &cull_dsl) != VK_SUCCESS) return 0;
+    pli.setLayoutCount = 1, pli.pSetLayouts = &cull_dsl, pli.pushConstantRangeCount = 1, pli.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(g_vkr.dev, &pli, NULL, &cull_pl) != VK_SUCCESS) return 0;
+    if (vkCreateDescriptorPool(g_vkr.dev, &dpi, NULL, &cull_dp) != VK_SUCCESS) return 0;
+    for (int i = 0; i < NFRAME; i++) {
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, cull_dp, 1, &cull_dsl};
+        if (vkAllocateDescriptorSets(g_vkr.dev, &ai, &cull_set[i]) != VK_SUCCESS) return 0;
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_OCCLUSION, qi.queryCount = CQ_MAX;
+        if (vkCreateQueryPool(g_vkr.dev, &qi, NULL, &cq_pool[i]) != VK_SUCCESS) return 0;
+    }
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", NULL};
+    ci.layout = cull_pl;
+    VkResult r = vkCreateComputePipelines(g_vkr.dev, VK_NULL_HANDLE, 1, &ci, NULL, &cull_pipe);
+    vkDestroyShaderModule(g_vkr.dev, m, NULL);
+    if (r != VK_SUCCESS) { cull_pipe = VK_NULL_HANDLE; return 0; }
+    cull_broken = 0;
+    som_log("vkr: occlusion culling ready (indirect first instance %s)", cull_first_inst ? "yes" : "no");
+    return 1;
+}
+
+/* at the start of a submit (outside any pass) */
+static void cull_submit_begin(void) {
+    uint64_t now = now_ns();
+    if (now >= cull_next_read) {
+        cull_next_read = now + 2000000000ull;
+        char path[600];
+        snprintf(path, sizeof path, "%s/occl_cull", som_data_dir());
+        FILE *f = fopen(path, "r");
+        int v = -1;
+        if (f) {
+            if (fscanf(f, "%d", &v) != 1) v = -1;
+            fclose(f);
+        }
+        extern int som_gpu_is_mali(void), som_cull_choice(void);
+        if (v < 0) v = som_cull_choice() == 1 ? 1 : som_cull_choice() == 2 ? 0 : som_gpu_is_mali();
+        if (v != cull_want) som_log("vkr: occlusion culling %s", v ? "on" : "off");
+        cull_want = v;
+    }
+    cull_on = cull_want == 1 && cull_init();
+    cprod_n = 0, cpass_ok = 0;
+    memset(cprod_head, 0, sizeof cprod_head);
+    if (!cull_on) return;
+    if (cull_set_buf[fr_cur] != ring_buf) { /* the frame context's ring, the whole of it */
+        VkDescriptorBufferInfo bi = {ring_buf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, cull_set[fr_cur], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
+        vkUpdateDescriptorSets(g_vkr.dev, 1, &w, 0, NULL);
+        cull_set_buf[fr_cur] = ring_buf;
+    }
+    vkCmdResetQueryPool(R.cb, cq_pool[fr_cur], 0, CQ_MAX);
+    cst_sub++;
+    if (!cst_t) cst_t = now;
+    if (now - cst_t >= 5000000000ull) {
+        som_log("vkr: occlusion culling: %.0f queried draws, %.0f conditional draws per submit (%.1f kept plain: the earlier draw's depth test or bias cannot prove them hidden)",
+                (double)cst_prod / (double)cst_sub, (double)cst_cond / (double)cst_sub, (double)cst_kept / (double)cst_sub);
+        cst_prod = cst_cond = cst_sub = cst_kept = 0, cst_t = now;
+    }
+}
+
+static int depth_dir(int df) { return df == 2 || df == 4 ? 1 : df == 5 || df == 7 ? 2 : 0; }
+/* Can a draw with depth test cdf pass where an earlier draw of the same surface with test pdf passed nowhere? Not if
+ * pdf includes equality (LEQUAL/GEQUAL: every pixel then held something strictly nearer, and depth only gets nearer),
+ * whatever cdf of that direction or EQUAL. With a strict pdf (LESS/GREATER) a surface at exactly the same depth hides
+ * it: only a later strict test of the same direction fails the same way. (Battle map: a unit's ring frame, GREATER,
+ * hidden under the cursor at the same depth, took its portrait, GEQUAL, with it.) */
+static int depth_hides(int pdf, int cdf) {
+    if (pdf == 4) return cdf == 4 || cdf == 2 || cdf == 3;
+    if (pdf == 7) return cdf == 7 || cdf == 5 || cdf == 3;
+    return (pdf == 2 || pdf == 5) && cdf == pdf;
+}
+
+/* a pass about to begin (outside it): a depth clear on load moves the depth away; with producers on this depth image,
+ * their results so far go to the ring and the compute pass sets the instance counts of this pass's conditional draws */
+static void cull_pass_open(uint32_t pclear) {
+    cpass_ok = 0;
+    if (R.depth && (pclear >> 8 & 1)) R.depth->dgen++, R.depth->ddir = 0;
+    if (!cull_on || !R.depth || !cprod_n) return;
+    int any = 0;
+    for (uint32_t i = 0; i < cprod_n && !any; i++) any = cprod[i].dimg == R.depth->serial && cprod[i].dgen == R.depth->dgen;
+    if (!any) return;
+    uint64_t voff, joff;
+    uint8_t *vp = ring_alloc((uint64_t)cprod_n * 4, 16, &voff);
+    uint8_t *jp = ring_alloc(16 + (uint64_t)CJ_MAX * 24, 16, &joff);
+    if (!vp || !jp) return;
+    cpass_n = (uint32_t *)jp, *cpass_n = 0;
+    cpass_jobs = (uint32_t *)(jp + 16), cpass_jobs_w = (uint32_t)((joff + 16) / 4);
+    cpass_q0 = cprod_n, cpass_dimg = R.depth->serial;
+    vkCmdCopyQueryPoolResults(R.cb, cq_pool[fr_cur], 0, cprod_n, ring_buf, voff, 4, VK_QUERY_RESULT_WAIT_BIT);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(R.cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(R.cb, VK_PIPELINE_BIND_POINT_COMPUTE, cull_pipe);
+    vkCmdBindDescriptorSets(R.cb, VK_PIPELINE_BIND_POINT_COMPUTE, cull_pl, 0, 1, &cull_set[fr_cur], 0, NULL);
+    uint32_t pc[4] = {(uint32_t)(voff / 4), cpass_jobs_w, (uint32_t)(joff / 4), 0};
+    vkCmdPushConstants(R.cb, cull_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(R.cb, CJ_MAX / 64, 1, 1);
+    VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+    vkCmdPipelineBarrier(R.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
+    cpass_ok = 1;
+}
+
+/* depth contents changed by something other than a draw (clear inside a pass, copy into the image) */
+static void cull_depth_changed(Img *d) {
+    if (d) d->dgen++, d->ddir = 0;
+}
+
+/* the object-to-world matrix of a draw: words 0-15 of its 160-byte per-object vertex constants (Unity's UnityPerDraw) */
+static const uint8_t *cull_matrix(const Shader *vs) {
+    for (int k = 0; k < vs->ncb; k++) {
+        int sl = vs->cb[k].slot;
+        const p_bind_buf *b = sl >= 3 && sl - 3 < 16 ? &R.ubo[0][sl - 3] : NULL;
+        if (b && b->addr && b->size == 160 && nvn_pool_find(b->addr, 160)) return (const uint8_t *)(uintptr_t)b->addr;
+    }
+    return NULL;
+}
+static int cull_has_matrix(const Shader *vs, const uint8_t *m) { /* m among the draw's vertex constants, word aligned */
+    for (int k = 0; k < vs->ncb; k++) {
+        int sl = vs->cb[k].slot;
+        const p_bind_buf *b = sl >= 3 && sl - 3 < 16 ? &R.ubo[0][sl - 3] : NULL;
+        if (!b || !b->addr || b->size < 64) continue;
+        uint64_t n = b->size > 4096 ? 4096 : b->size;
+        if (!nvn_pool_find(b->addr, n)) continue;
+        const uint8_t *p = (const uint8_t *)(uintptr_t)b->addr;
+        for (uint64_t o = 0; o + 64 <= n; o += 16)
+            if (!memcmp(p + o, m, 64)) return 1;
+    }
+    return 0;
+}
+
+/* one draw (indexed or not; the index buffer is bound): a producer, a conditional draw, or a plain one */
+static void cull_draw(const Shader *vs, const char *vk, const char *fk, int prim, int indexed, uint32_t count, uint32_t ninst,
+                      int first, int base_vertex, uint32_t base_instance, uint64_t ibuf) {
+    uint32_t didx = (uint32_t)(R.draws - 1 - pass_draw0);
+    int dir = depth_dir((int)R.ds.df);
+    Img *d = R.depth;
+    if (!cull_on || !d || !R.ds.dt) {
+        if (d && R.ds.dt && R.ds.dw && dir == 0 && R.ds.df != 3) cull_depth_changed(d); /* ALWAYS, NOT_EQUAL...: anything */
+        oq_begin(vk, fk, count, ninst, didx);
+        if (indexed) vkCmdDrawIndexed(R.cb, count, ninst, 0, base_vertex, base_instance);
+        else vkCmdDraw(R.cb, count, ninst, (uint32_t)first, base_instance);
+        oq_end();
+        return;
+    }
+    uint64_t mesh = 1469598103934665603ull, vpk = 1469598103934665603ull, bias = 1469598103934665603ull;
+#define CMIX(h, v) do { h = (h ^ (uint64_t)(v)) * 1099511628211ull; } while (0)
+    CMIX(mesh, ibuf); CMIX(mesh, (uint32_t)first); CMIX(mesh, (uint32_t)base_vertex); CMIX(mesh, count); CMIX(mesh, ninst);
+    CMIX(mesh, R.vbuf[0].address); CMIX(mesh, prim); CMIX(mesh, indexed); CMIX(mesh, base_instance);
+    {
+        uint32_t vw[8];
+        memcpy(vw, R.vp, 16), memcpy(vw + 4, R.depth_range, 8), vw[6] = R.rt_w, vw[7] = R.rt_h;
+        for (int i = 0; i < 8; i++) CMIX(vpk, vw[i]);
+        uint32_t bw[4] = {R.poly.offset_en, 0, 0, 0}; /* depth bias: the same surface at another depth */
+        if (R.poly.offset_en) memcpy(bw + 1, R.poly_off, 12);
+        for (int i = 0; i < 4; i++) CMIX(bias, bw[i]);
+    }
+#undef CMIX
+    /* a conditional draw: every earlier draw of this object on this depth image is known (results copied at the
+     * pass start), and there are at most 4 */
+    if (cpass_ok && d->serial == cpass_dimg && *cpass_n < CJ_MAX && (R.ds.df == 3 || dir) && (base_instance == 0 || cull_first_inst)) {
+        uint32_t qs[4], nq = 0;
+        int bad = 0;
+        for (uint32_t i = cprod_head[mesh & 1023]; i && !bad; i = cprod_next[i - 1]) {
+            const CProd *c = &cprod[i - 1];
+            if (c->mesh != mesh || c->vpk != vpk || c->dimg != d->serial || c->dgen != d->dgen || !cull_has_matrix(vs, c->mat)) continue;
+            if (c->bias != bias || !depth_hides(c->df, (int)R.ds.df)) bad = 1, cst_kept++;
+            else if (c->q >= cpass_q0 || nq == 4 || (R.ds.df != 3 && depth_dir((int)R.ds.df) != d->ddir)) bad = 1;
+            else qs[nq++] = c->q;
+        }
+        if (nq && !bad) {
+            uint64_t aoff;
+            uint32_t *a = (uint32_t *)ring_alloc(20, 4, &aoff);
+            if (a) {
+                if (indexed) a[0] = count, a[1] = ninst, a[2] = 0, a[3] = (uint32_t)base_vertex, a[4] = base_instance;
+                else a[0] = count, a[1] = ninst, a[2] = (uint32_t)first, a[3] = base_instance;
+                uint32_t *j = cpass_jobs + *cpass_n * 6;
+                j[0] = (uint32_t)(aoff / 4) + 1, j[1] = ninst;
+                for (uint32_t k = 0; k < 4; k++) j[2 + k] = k < nq ? qs[k] : 0xffffffffu;
+                (*cpass_n)++;
+                cst_cond++;
+                if (R.ds.dw) d->ddir = d->ddir ? d->ddir : dir;
+                if (indexed) vkCmdDrawIndexedIndirect(R.cb, ring_buf, aoff, 1, 20);
+                else vkCmdDrawIndirect(R.cb, ring_buf, aoff, 1, 16);
+                return;
+            }
+        }
+    }
+    /* a producer: depth written with a less/greater test, no stencil test (a stencil failure is not occlusion) */
+    const uint8_t *m = R.ds.dw && dir && !R.ds.st && cprod_n < CQ_MAX ? cull_matrix(vs) : NULL;
+    if (R.ds.dw) {
+        if (d->ddir && dir && dir != d->ddir) cull_depth_changed(d); /* the other direction: depth may move away */
+        else if (R.ds.df != 3 && !dir) cull_depth_changed(d);
+        if (dir) d->ddir = dir;
+    }
+    if (m) {
+        CProd *c = &cprod[cprod_n];
+        c->mesh = mesh, c->vpk = vpk, c->dimg = d->serial, c->dgen = d->dgen, c->q = cprod_n, c->bias = bias, c->df = (int)R.ds.df;
+        memcpy(c->mat, m, 64);
+        cprod_next[cprod_n] = cprod_head[mesh & 1023];
+        cprod_head[mesh & 1023] = cprod_n + 1;
+        vkCmdBeginQuery(R.cb, cq_pool[fr_cur], cprod_n, 0);
+        cprod_n++;
+        cst_prod++;
+    }
+    if (indexed) vkCmdDrawIndexed(R.cb, count, ninst, 0, base_vertex, base_instance);
+    else vkCmdDraw(R.cb, count, ninst, (uint32_t)first, base_instance);
+    if (m) vkCmdEndQuery(R.cb, cq_pool[fr_cur], cprod_n - 1);
+}
+
 /* begin the pass set up by pass_setup(1), with the whole-target clears that came first done as load ops */
 static void pass_open(void) {
     if (R.in_pass != 2) return;
@@ -1386,7 +1740,9 @@ static void pass_open(void) {
     bi.renderArea = (VkRect2D){{0, 0}, {R.rt_w, R.rt_h}};
     bi.clearValueCount = R.pclear ? nv : 0;
     bi.pClearValues = cv;
+    cull_pass_open(R.pclear);
     pass_no++;
+    pass_draw0 = R.draws;
     gp_pass_begin(R.pclear);
     vkCmdBeginRenderPass(R.cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     if (R.pclear) PS.n_lclear++;
@@ -1925,6 +2281,22 @@ static void pipe_wait(PipeEnt *e) {      /* until a worker has built it */
     }
 }
 
+/* The vertex input state as pipeline creation reads it: attributes with a Vulkan format on a used stream, and for
+ * used streams the stride and whether they step per instance. Everything else (strides left behind in streams the
+ * shaders do not read, divisor values) would only split one pipeline into several identical ones: in the Somniel,
+ * 1,298 recipe states were 520 distinct pipelines, each of the others compiled again (~100 ms on Mali). */
+static void vtx_key_state(const uint32_t vattr_in[16], const vs_st vstream_in[16], uint32_t used, uint32_t vattr[16], vs_st vstream[16]) {
+    for (int l = 0; l < 16; l++) {
+        va_st a;
+        memcpy(&a, &vattr_in[l], sizeof a);
+        vattr[l] = a.fmt && vtx_fmt((int)a.fmt) != VK_FORMAT_UNDEFINED && (used >> a.stream & 1) ? vattr_in[l] : 0;
+    }
+    for (int i = 0; i < 16; i++) {
+        vstream[i].stride = used >> i & 1 ? vstream_in[i].stride : 0;
+        vstream[i].divisor = used >> i & 1 && vstream_in[i].divisor ? 1 : 0;
+    }
+}
+
 /* Pipeline for the current state and the two shaders; the key hashes everything that goes into it. */
 static VkPipeline pipeline_for(Shader *vs, Shader *fs, int prim, VkPipelineLayout layout, uint32_t used_streams) {
     g_pipe_late = 0;
@@ -1932,8 +2304,11 @@ static VkPipeline pipeline_for(Shader *vs, Shader *fs, int prim, VkPipelineLayou
 #define MIX(p, n) do { const uint8_t *q_ = (const uint8_t *)(p); for (size_t k_ = 0; k_ < (n); k_++) h = (h ^ q_[k_]) * 1099511628211ull; } while (0)
     MIX(vs->key, 40); MIX(fs->key, 40); MIX(&prim, 4); MIX(&R.rp, sizeof R.rp);
     MIX(R.blend, sizeof R.blend); MIX(&R.cstate, sizeof R.cstate); MIX(&R.chmask, sizeof R.chmask); MIX(&R.ms, sizeof R.ms);
-    MIX(&R.poly, sizeof R.poly); MIX(&R.ds, sizeof R.ds); MIX(R.vattr, sizeof R.vattr); MIX(&used_streams, 4);
-    for (int i = 0; i < 16; i++) { MIX(&R.vstream[i], sizeof R.vstream[i]); }
+    uint32_t kva[16];
+    vs_st kvs[16];
+    vtx_key_state((const uint32_t *)R.vattr, R.vstream, used_streams, kva, kvs);
+    MIX(&R.poly, sizeof R.poly); MIX(&R.ds, sizeof R.ds); MIX(kva, sizeof kva); MIX(&used_streams, 4);
+    MIX(kvs, sizeof kvs);
     MIX(&R.n_color, 4);
     int flags = vkr_flags();
     MIX(&flags, 4);
@@ -2843,10 +3218,42 @@ static void do_draw_inner(int prim, int indexed, int count, int first, int base_
         return;
     }
     /* experiment: -3 skips the draws of passes into a presented (window) image */
-    if (g_skip_pass != -1 && (g_skip_pass == -2 || (pass_no >= g_skip_pass && pass_no <= g_skip_hi) ||
-                              (g_skip_pass == -3 && R.n_color && R.color[0] && R.color[0]->presented))) {
-        gp_first_draw(fs->key);
-        return;
+    if (g_skip_pass != -1) {
+        int in_range = pass_no >= g_skip_pass && pass_no <= g_skip_hi;
+        long di = (long)(R.draws - 1 - pass_draw0); /* this draw's index inside the pass */
+        if (g_skip_dlo == -9) {
+            static uint64_t listed_until; /* list one submit's draws of the pass, every 5 s */
+            static int listing;
+            if (pass_no == g_skip_pass && di == 0) {
+                uint64_t now = now_ns();
+                listing = now >= listed_until;
+                if (listing) listed_until = now + 5000000000ull;
+            }
+            if (listing && pass_no >= g_skip_pass && pass_no <= g_skip_hi) {
+                char ub[400];
+                int o = 0;
+                for (int k = 0; k < vs->ncb && o < 360; k++) { /* the vertex stage's constant buffers: address, size, contents hash */
+                    int sl = vs->cb[k].slot;
+                    const p_bind_buf *b = sl >= 3 && sl - 3 < 16 ? &R.ubo[0][sl - 3] : NULL;
+                    if (!b || !b->addr) continue;
+                    uint64_t n = b->size > 4096 ? 4096 : b->size, h = 1469598103934665603ull;
+                    if (nvn_pool_find(b->addr, n))
+                        for (uint64_t q = 0; q < n; q++) h = (h ^ ((const uint8_t *)(uintptr_t)b->addr)[q]) * 1099511628211ull;
+                    o += snprintf(ub + o, sizeof ub - (size_t)o, " c%d %llx+%llu #%08llx", sl, (unsigned long long)b->addr, (unsigned long long)b->size,
+                                  (unsigned long long)(h & 0xffffffffull));
+                }
+                ub[o] = 0;
+                som_log("vkr: pass %d draw %ld: vs %.16s fs %.16s prim %d count %d inst %d idx %d ib %llx first %d bv %d vb0 %llx |%s", pass_no, di, vk,
+                        fk, prim, count, instances, indexed, (unsigned long long)ibuf, first, base_vertex, (unsigned long long)R.vbuf[0].address, ub);
+            }
+            in_range = 0;
+        } else if (in_range && g_skip_dlo >= 0) {
+            in_range = di >= g_skip_dlo && di <= g_skip_dhi;
+        }
+        if (g_skip_pass == -2 || in_range || (g_skip_pass == -3 && R.n_color && R.color[0] && R.color[0]->presented)) {
+            gp_first_draw(fs->key);
+            return;
+        }
     }
     vkCmdBindPipeline(R.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     gp_first_draw(fs->key);
@@ -2873,7 +3280,9 @@ static void do_draw_inner(int prim, int indexed, int count, int first, int base_
             for (int k = 0; k < 6; k++) ix[q * 6 + (uint32_t)k] = v[tri[k]];
         }
         vkCmdBindIndexBuffer(R.cb, ring_buf, off, VK_INDEX_TYPE_UINT32);
+        oq_begin(vk, fk, (uint32_t)count, ninst, (uint32_t)(R.draws - 1 - pass_draw0));
         vkCmdDrawIndexed(R.cb, nq * 6, ninst, 0, indexed ? base_vertex : first, (uint32_t)base_instance);
+        oq_end();
         return;
     }
     if (indexed) {
@@ -2890,9 +3299,9 @@ static void do_draw_inner(int prim, int indexed, int count, int first, int base_
             dd_add(ibuf, n, DD_IB, off);
         }
         vkCmdBindIndexBuffer(R.cb, ring_buf, off, isz == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
-        vkCmdDrawIndexed(R.cb, (uint32_t)count, ninst, 0, base_vertex, (uint32_t)base_instance);
+        cull_draw(vs, vk, fk, prim, 1, (uint32_t)count, ninst, first, base_vertex, (uint32_t)base_instance, ibuf);
     } else {
-        vkCmdDraw(R.cb, (uint32_t)count, ninst, (uint32_t)first, (uint32_t)base_instance);
+        cull_draw(vs, vk, fk, prim, 0, (uint32_t)count, ninst, first, base_vertex, (uint32_t)base_instance, 0);
     }
 }
 
@@ -2975,12 +3384,16 @@ static void do_clear_ds(const p_clear_ds *c) {
         return;
     }
     begin_pass();
-    if (rc.rect.extent.width && rc.rect.extent.height) vkCmdClearAttachments(R.cb, 1, &a, 1, &rc);
+    if (rc.rect.extent.width && rc.rect.extent.height) {
+        vkCmdClearAttachments(R.cb, 1, &a, 1, &rc);
+        if (as & VK_IMAGE_ASPECT_DEPTH_BIT) cull_depth_changed(R.depth);
+    }
 }
 
 static void do_copy_b2t(const p_copy_b2t *c) {
     end_pass();
     Img *i = img_get(c->tex);
+    if (i && i->is_depth) cull_depth_changed(i);
     if (!i || !c->src || !nvn_pool_find(c->src, 1)) return;
     img_init(i);
     i->loaded = 1;
@@ -3032,6 +3445,7 @@ static void do_copy_b2t(const p_copy_b2t *c) {
 static void do_copy_t2t(const p_copy_t2t *c) {
     end_pass();
     Img *s = c->src ? img_get(c->src) : NULL, *d = c->dst ? img_get(c->dst) : NULL;
+    if (d && d->is_depth) cull_depth_changed(d);
     if (!s || !d || s == d) return;
     if (s->drop || d->drop) { /* a reduced texture (Texture size) in a texture copy: should not happen */
         static int warned;
@@ -3149,6 +3563,7 @@ void vkr_submit_begin(void) {
         vkResetFences(g_vkr.dev, 1, &FR[fr_cur].fence);
         FR[fr_cur].pending = 0;
         gp_collect();
+        oq_collect();
     }
     {
         /* ADPF: the frame that just ended (from the previous submit's start to this one), its CPU part (without the
@@ -3171,6 +3586,8 @@ void vkr_submit_begin(void) {
     cap_check();
     cmd_begin();
     gp_submit_begin();
+    oq_submit_begin();
+    cull_submit_begin();
     if (submit_count == 1 && !pipe_async_on()) rec_open(); /* in-frame mode (Mali) only */
     prebuild_step();
 }
@@ -3376,8 +3793,52 @@ typedef struct {
 static FILE *g_rec_f;
 static PipeRec *g_recs;
 static size_t g_nrecs, g_rec_next;
+/* hashes of the recipes known (file + this session): a pipeline built again in a later session (its key has this
+ * session's render pass handle in it) is not appended again */
+#define REC_SET (1u << 15)
+static uint64_t *g_rec_set;
+static unsigned g_rec_set_n;
+static uint64_t rec_hash(const PipeRec *r) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *q = (const uint8_t *)r + offsetof(PipeRec, vk); /* everything but the key */
+    for (size_t k = 0; k < sizeof *r - offsetof(PipeRec, vk); k++) h = (h ^ q[k]) * 1099511628211ull;
+    return h ? h : 1;
+}
+static int rec_seen(uint64_t h) { /* 1 if known; else remembered and 0 */
+    if (!g_rec_set && !(g_rec_set = calloc(REC_SET, sizeof *g_rec_set))) return 0;
+    for (uint32_t i = (uint32_t)h & (REC_SET - 1), t = 0; t < 64; t++, i = (i + 1) & (REC_SET - 1)) {
+        if (g_rec_set[i] == h) return 1;
+        if (!g_rec_set[i]) {
+            if (g_rec_set_n < REC_SET / 2) g_rec_set[i] = h, g_rec_set_n++;
+            return 0;
+        }
+    }
+    return 0;
+}
+/* a shader key as the recipes hold it: 16 hex digits, then nothing or "_" and a variant suffix */
+static int rec_key_ok(const char *k) {
+    for (int i = 0; i < 16; i++)
+        if (!((k[i] >= '0' && k[i] <= '9') || (k[i] >= 'a' && k[i] <= 'f'))) return 0;
+    if (k[16] == 0) return 1;
+    if (k[16] != '_') return 0;
+    for (int i = 17; i < 40; i++) {
+        if (!k[i]) return 1;
+        if (k[i] < 0x21 || k[i] > 0x7e) return 0;
+    }
+    return 0;
+}
+static int rec_ok(const PipeRec *r) {
+    return rec_key_ok(r->vk) && rec_key_ok(r->fk) && r->n_color >= 0 && r->n_color <= MAXI && r->prim >= 0 && r->prim < 16;
+}
+static void rec_normalise(PipeRec *r) {
+    uint32_t va[16];
+    vs_st vs[16];
+    vtx_key_state(r->vattr, r->vstream, r->used, va, vs);
+    memcpy(r->vattr, va, sizeof va), memcpy(r->vstream, vs, sizeof vs);
+    r->key = 0;
+}
 static int g_rec_state; /* 0 not opened, 1 open, -1 unavailable */
-static unsigned g_pb_queued, g_pb_skipped;
+static unsigned g_pb_queued, g_pb_skipped, g_pb_skip_shader;
 static uint64_t g_pb_t0;
 
 static void rec_path(char *path, size_t cap) {
@@ -3394,22 +3855,53 @@ static void rec_open(void) {
     rec_path(path, sizeof path);
     uint32_t hdr[2] = {REC_MAGIC, (uint32_t)sizeof(PipeRec)};
     FILE *f = fopen(path, "rb");
-    int fresh = 1;
+    int fresh = 1, torn = 0;
     if (f) {
         uint32_t h[2];
         if (fread(h, 1, sizeof h, f) == sizeof h && h[0] == hdr[0] && h[1] == hdr[1]) {
             fseek(f, 0, SEEK_END);
             long sz = ftell(f) - (long)sizeof h;
-            size_t n = sz > 0 ? (size_t)sz / sizeof(PipeRec) : 0;
             fseek(f, (long)sizeof h, SEEK_SET);
-            if (n && (g_recs = malloc(n * sizeof(PipeRec)))) g_nrecs = fread(g_recs, sizeof(PipeRec), n, f);
+            uint8_t *raw = sz > 0 ? malloc((size_t)sz) : NULL;
+            size_t got = raw ? fread(raw, 1, (size_t)sz, f) : 0;
+            /* Records are taken where they check out. A write cut short (the app killed while appending) leaves a
+             * partial record; reading on in steps of a record from there turned every later recipe into garbage
+             * (2,396 of 5,569 on the Galaxy Tab A11+), so past a bad record the next good one is searched for. */
+            if (got >= sizeof(PipeRec) && (g_recs = malloc(got / sizeof(PipeRec) * sizeof(PipeRec)))) {
+                size_t off = 0, bad = 0;
+                while (off + sizeof(PipeRec) <= got) {
+                    PipeRec r;
+                    memcpy(&r, raw + off, sizeof r);
+                    if (rec_ok(&r)) g_recs[g_nrecs++] = r, off += sizeof r;
+                    else off++, bad++;
+                }
+                bad += got - off;
+                if (bad) som_log("vkr: pipeline recipes: %zu damaged bytes skipped", bad), torn = 1;
+            }
+            free(raw);
             fresh = 0;
         }
         fclose(f);
     }
+    /* drop the copies (files from before the recipes were normalised hold several per pipeline) and, if there were
+     * any, write the file again without them */
+    size_t in = g_nrecs, out = 0;
+    for (size_t i = 0; i < in; i++) {
+        rec_normalise(&g_recs[i]);
+        if (!rec_seen(rec_hash(&g_recs[i]))) g_recs[out++] = g_recs[i];
+    }
+    g_nrecs = out;
+    if (!fresh && (out < in || torn)) {
+        if (out < in) som_log("vkr: pipeline recipes: %zu copies dropped", in - out);
+        fresh = 1; /* written again, clean */
+    }
     g_rec_f = fopen(path, fresh ? "wb" : "ab");
     if (!g_rec_f) return;
-    if (fresh) fwrite(hdr, 1, sizeof hdr, g_rec_f), fflush(g_rec_f);
+    if (fresh) {
+        fwrite(hdr, 1, sizeof hdr, g_rec_f);
+        if (g_nrecs) fwrite(g_recs, sizeof(PipeRec), g_nrecs, g_rec_f);
+        fflush(g_rec_f);
+    }
     g_rec_state = 1;
     som_log("vkr: pipeline recipes: %zu from earlier sessions%s", g_nrecs, fresh ? " (new file)" : "");
 }
@@ -3428,6 +3920,9 @@ static void rec_add(Shader *vs, Shader *fs, int prim, uint32_t used, int flags, 
     memcpy(r.blend, R.blend, sizeof r.blend);
     r.cstate = R.cstate, r.chmask = R.chmask, r.ms = R.ms, r.poly = R.poly, r.ds = R.ds;
     memcpy(r.vattr, R.vattr, sizeof r.vattr), memcpy(r.vstream, R.vstream, sizeof r.vstream);
+    rec_normalise(&r);
+    if (rec_seen(rec_hash(&r))) return; /* known from an earlier session */
+    r.key = key;
     fwrite(&r, sizeof r, 1, g_rec_f);
 }
 
@@ -3447,7 +3942,7 @@ static void prebuild_step(void) {
         const PipeRec *r = &g_recs[g_rec_next++];
         if (r->flags != flags || r->minus_w != minus_w || r->n_color < 0 || r->n_color > MAXI) { g_pb_skipped++; continue; }
         Shader *vs = shader_load1(r->vk, 0), *fs = shader_load1(r->fk, 1);
-        if (!vs || !fs || vs->unsupported || fs->unsupported) { g_pb_skipped++; continue; }
+        if (!vs || !fs || vs->unsupported || fs->unsupported) { g_pb_skipped++, g_pb_skip_shader++; continue; }
         memcpy(R.blend, r->blend, sizeof R.blend);
         R.cstate = r->cstate, R.chmask = r->chmask, R.ms = r->ms, R.poly = r->poly, R.ds = r->ds;
         memcpy(R.vattr, r->vattr, sizeof R.vattr), memcpy(R.vstream, r->vstream, sizeof R.vstream);
@@ -3460,8 +3955,8 @@ static void prebuild_step(void) {
     g_prebuilding = g_pipe_queue = g_pipe_low = 0;
     R = R_scan_saved;
     if (g_rec_next >= g_nrecs)
-        som_log("vkr: prebuild done: %u pipelines queued, %u already made, %u skipped, %.1f s", g_pb_queued,
-                (unsigned)(g_nrecs - g_pb_queued - g_pb_skipped), g_pb_skipped, (double)(now_ns() - g_pb_t0) / 1e9);
+        som_log("vkr: prebuild done: %u pipelines queued, %u already made, %u skipped (%u for a shader not loaded), %.1f s", g_pb_queued,
+                (unsigned)(g_nrecs - g_pb_queued - g_pb_skipped), g_pb_skipped, g_pb_skip_shader, (double)(now_ns() - g_pb_t0) / 1e9);
 }
 
 void vkr_op(const op_hdr *h, const void *a) {

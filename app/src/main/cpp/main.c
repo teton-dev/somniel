@@ -345,6 +345,7 @@ static bool init_vulkan(Gfx *g) {
     want.shaderClipDistance = pf.shaderClipDistance;
     want.shaderCullDistance = pf.shaderCullDistance;
     want.multiDrawIndirect = pf.multiDrawIndirect;
+    want.drawIndirectFirstInstance = pf.drawIndirectFirstInstance; /* occlusion culling (vkr.c): indirect draws with a base instance */
     want.shaderStorageImageExtendedFormats = pf.shaderStorageImageExtendedFormats;
     want.fragmentStoresAndAtomics = pf.fragmentStoresAndAtomics;
     want.vertexPipelineStoresAndAtomics = pf.vertexPipelineStoresAndAtomics;
