@@ -20,6 +20,11 @@ public class SomnielActivity extends SDLActivity {
     /** Frame rate 30, 40 or 60 and render scale in percent (50 to 125): applied live (game_patches.c). */
     static native void nativeSetFrameRate(int fps);
     static native void nativeSetRenderScale(int pct);
+    /** The frame rate used until the user picks one: 30 on the handheld profile (Mali GPUs), else 60 (sidebar.c). */
+    static native int nativeDefaultFrameRate();
+    /** Graphics options (game_patches.c): key 0 shadows (0 High .. 3 Off), 1 model detail (0 Normal .. 2 Low),
+     *  2 texture sharpness (0 Normal .. 2 Soft). 0 everywhere renders as the game does. */
+    static native void nativeSetGraphics(int key, int value);
     /** The performance monitor level the overlay draws: 0 off, 1 FPS, 2 + frame times and graph, 3 + temperatures (overlay.c). */
     static native void nativeSetMonitorLevel(int level);
 
@@ -153,6 +158,7 @@ public class SomnielActivity extends SDLActivity {
         nativeSetMonitorLevel(sidebar.monitorLevel());
         nativeSetFrameRate(sidebar.frameRate());
         nativeSetRenderScale(sidebar.renderScale());
+        sidebar.pushGraphics();
 
         getWindow().getDecorView().post(() -> {
             // boot notices: the untested-GPU warning first, then the one-time telemetry question

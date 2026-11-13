@@ -5,3 +5,7 @@ local.properties
 runs/
 
 signing/
+.cxx/
+scripts/*.png
+# vendored upstream clone, unmodified: see third_party/SDL-VERSION.txt
+third_party/SDL/

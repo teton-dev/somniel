@@ -31,6 +31,29 @@ import android.widget.Toast;
  */
 final class Sidebar {
     private static final int[] FPS_CHOICES = {30, 40, 60};
+
+    /** Graphics options: native key, preference name, row title, choice names (index = value; 0 = as the game renders). */
+    private static final Object[][] GFX = {
+        {4, "gfx_profile", "Console mode", new String[] {"Auto", "Handheld (after restart)", "Docked (after restart)"}},
+        {7, "gfx_aspect", "Aspect ratio", new String[] {"Stretch to fill", "16:9"}},
+        {0, "gfx_shadows", "Shadows", new String[] {"High", "Medium", "Low", "Off"}},
+        {6, "gfx_fxaa", "Anti-aliasing", new String[] {"On", "Off"}},
+        {2, "gfx_texbias", "Texture sharpness", new String[] {"Normal", "Softer (after restart)", "Soft (after restart)"}},
+        {5, "gfx_texsize", "Texture size", new String[] {"Full", "Half (after restart)", "Quarter (after restart)"}},
+        {3, "gfx_shaders", "Shader precision", new String[] {"Accurate", "Fast (after restart)", "Fastest, experimental: some text breaks (after restart)"}},
+    };
+
+    int graphics(int i) {
+        String[] names = (String[]) GFX[i][3];
+        int v = prefs.getInt((String) GFX[i][1], 0);
+        return v >= 0 && v < names.length ? v : 0;
+    }
+
+    /** Sends every saved graphics option to the native side (at start; Console mode is also sent from the constructor,
+     *  before anything asks the native side for the profile). */
+    void pushGraphics() {
+        for (int i = 0; i < GFX.length; i++) SomnielActivity.nativeSetGraphics((Integer) GFX[i][0], graphics(i));
+    }
     static final int SCALE_MIN = 50, SCALE_MAX = 125, SCALE_STEP = 5; // percent of the game's render size
 
     private final SomnielActivity act;
@@ -41,16 +64,19 @@ final class Sidebar {
     private final View scrim;
     private final LinearLayout panel;
     private final LinearLayout mainPage, modsPage;
-    private LinearLayout driversPage, touchPage;
+    private LinearLayout driversPage, touchPage, graphicsPage;
     private android.widget.RadioGroup driverGroup;
     private TextView driverStatus;
-    private View firstFocus, modsFocus, driversFocus, touchFocus;
-    private boolean open, modsShown, driversShown, touchShown;
+    private View firstFocus, modsFocus, driversFocus, touchFocus, graphicsFocus;
+    private boolean open, modsShown, driversShown, touchShown, graphicsShown;
+    private ScrollView sv;
 
     Sidebar(SomnielActivity act) {
         this.act = act;
         this.prefs = act.getSharedPreferences("sidebar", Context.MODE_PRIVATE);
         this.dp = act.getResources().getDisplayMetrics().density;
+        // the console profile is latched natively the first time anything asks for it (the default frame rate below)
+        SomnielActivity.nativeSetGraphics(4, graphics(0));
 
         root = new FrameLayout(act);
         root.setVisibility(View.GONE);
@@ -66,6 +92,15 @@ final class Sidebar {
         root.addView(panel, new FrameLayout.LayoutParams(px(340), -1, Gravity.START));
 
         TextView title = text("Somniel", 22, true);
+        {   /* the version in small, lighter text after the name */
+            String v = "  v" + BuildVersion.name(act);
+            android.text.SpannableString ss = new android.text.SpannableString("Somniel" + v);
+            int a = "Somniel".length(), b = ss.length();
+            ss.setSpan(new android.text.style.RelativeSizeSpan(0.55f), a, b, 0);
+            ss.setSpan(new android.text.style.ForegroundColorSpan(0xFF9AA3B8), a, b, 0);
+            ss.setSpan(new android.text.style.StyleSpan(Typeface.NORMAL), a, b, 0);
+            title.setText(ss);
+        }
         title.setPadding(px(20), px(10), px(20), px(4));
         panel.addView(title);
 
@@ -74,7 +109,7 @@ final class Sidebar {
         modsPage = new LinearLayout(act);
         modsPage.setOrientation(LinearLayout.VERTICAL);
         modsPage.setVisibility(View.GONE);
-        ScrollView sv = new ScrollView(act);
+        sv = new ScrollView(act);
         LinearLayout pages = new LinearLayout(act);
         pages.setOrientation(LinearLayout.VERTICAL);
         pages.addView(mainPage);
@@ -87,6 +122,10 @@ final class Sidebar {
         touchPage.setOrientation(LinearLayout.VERTICAL);
         touchPage.setVisibility(View.GONE);
         pages.addView(touchPage);
+        graphicsPage = new LinearLayout(act);
+        graphicsPage.setOrientation(LinearLayout.VERTICAL);
+        graphicsPage.setVisibility(View.GONE);
+        pages.addView(graphicsPage);
         sv.addView(pages);
         panel.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
 
@@ -94,6 +133,7 @@ final class Sidebar {
         buildMods();
         buildDrivers();
         buildTouch();
+        buildGraphics();
     }
 
     View view() { return root; }
@@ -103,10 +143,12 @@ final class Sidebar {
     /** The monitors' saved state; also pushed to the native overlay at start and on every change. */
     /** 0 off, 1 FPS, 2 FPS + frame times + graph, 3 adds CPU and GPU temperatures. Level 2 until the user changes it. */
     int monitorLevel() { return Math.max(0, Math.min(4, prefs.getInt("monitor_level", 2))); }
-    /** The saved frame rate (30, 40 or 60; 60 until performance detection picks a default) and render scale (%). */
+    /** The saved frame rate (30, 40 or 60; until the user picks one, the device default: 30 on the handheld profile used
+     *  for Mali GPUs, else 60) and render scale (%). */
     int frameRate() {
-        int f = prefs.getInt("fps_target", 60);
-        return f == 30 || f == 40 ? f : 60;
+        int def = SomnielActivity.nativeDefaultFrameRate();
+        int f = prefs.getInt("fps_target", def);
+        return f == 30 || f == 40 || f == 60 ? f : def;
     }
     int renderScale() {
         int p = prefs.getInt("render_scale", 100);
@@ -126,6 +168,7 @@ final class Sidebar {
         showMods(false);
         showDrivers(false);
         showTouch(false);
+        showGraphics(false);
         SomnielActivity.nativeSidebarOpen(true);
         root.setVisibility(View.VISIBLE);
         panel.setTranslationX(-px(340));
@@ -160,6 +203,7 @@ final class Sidebar {
         if (modsShown) { leaveMods(() -> showMods(false)); return true; }
         if (driversShown) { showDrivers(false); return true; }
         if (touchShown) { showTouch(false); return true; }
+        if (graphicsShown) { showGraphics(false); return true; }
         close();
         return true;
     }
@@ -199,7 +243,7 @@ final class Sidebar {
 
         // frame-rate drop-down (visual: nothing reads it yet; 60 is the default until performance detection exists)
         // A row that opens a PopupMenu: a real drop-down, and unlike a Spinner it cannot clip its own text.
-        final int[] fpsSel = {prefs.getInt("fps_target", 60)};
+        final int[] fpsSel = {frameRate()};
         Button fps = row("", null);
         fps.setText("Frame rate: " + fpsSel[0] + " FPS  ▾");
         fps.setOnClickListener(v -> {
@@ -241,6 +285,8 @@ final class Sidebar {
             @Override public void onStopTrackingTouch(SeekBar s) {}
         });
         mainPage.addView(scale, new LinearLayout.LayoutParams(-1, px(40)));
+
+        mainPage.addView(row("Graphics...", v -> showGraphics(true)));
 
         if (act.telemetry() != null && act.telemetry().available()) {
             Telemetry tel = act.telemetry();
@@ -512,6 +558,8 @@ final class Sidebar {
         modsPage.setVisibility(show ? View.VISIBLE : View.GONE);
         driversPage.setVisibility(View.GONE);
         touchPage.setVisibility(View.GONE);
+        graphicsPage.setVisibility(View.GONE);
+        graphicsShown = false;
         (show ? modsFocus : firstFocus).requestFocus();
     }
 
@@ -733,6 +781,8 @@ final class Sidebar {
         modsPage.setVisibility(View.GONE);
         touchPage.setVisibility(View.GONE);
         driversPage.setVisibility(show ? View.VISIBLE : View.GONE);
+        graphicsPage.setVisibility(View.GONE);
+        graphicsShown = false;
         (show ? driversFocus : firstFocus).requestFocus();
     }
 
@@ -746,7 +796,58 @@ final class Sidebar {
         modsPage.setVisibility(View.GONE);
         driversPage.setVisibility(View.GONE);
         touchPage.setVisibility(show ? View.VISIBLE : View.GONE);
+        graphicsPage.setVisibility(View.GONE);
+        graphicsShown = false;
         (show ? touchFocus : firstFocus).requestFocus();
+    }
+
+    // ---- graphics page: the GFX drop-downs ----
+
+    private void buildGraphics() {
+        Button back = row("<  Graphics", v -> showGraphics(false));
+        back.setTypeface(Typeface.DEFAULT_BOLD);
+        graphicsFocus = back;
+        graphicsPage.addView(back);
+        TextView note = text("Lower settings trade picture quality for speed. Options marked \"after restart\" "
+                + "take effect the next time the game starts. Console mode Auto: handheld on Mali GPUs, docked elsewhere. "
+                + "Anti-aliasing Off is faster on Mali GPUs.", 14, false);
+        note.setTextColor(0xFFB0B8CC);
+        note.setPadding(px(20), px(14), px(20), px(6));
+        graphicsPage.addView(note);
+        // drop-downs like the frame rate, applied at once unless marked "after restart"
+        for (int gi = 0; gi < GFX.length; gi++) {
+            final int i = gi;
+            final String title = (String) GFX[i][2];
+            final String[] names = (String[]) GFX[i][3];
+            Button b = row(title + ": " + names[graphics(i)] + "  ▾", null);
+            b.setOnClickListener(v -> {
+                android.widget.PopupMenu m = new android.widget.PopupMenu(act, b);
+                for (int k = 0; k < names.length; k++) m.getMenu().add(0, k, k, names[k]);
+                m.setOnMenuItemClickListener(it -> {
+                    int val = it.getItemId();
+                    prefs.edit().putInt((String) GFX[i][1], val).apply();
+                    SomnielActivity.nativeSetGraphics((Integer) GFX[i][0], val);
+                    b.setText(title + ": " + names[val] + "  ▾");
+                    return true;
+                });
+                m.show();
+            });
+            graphicsPage.addView(b);
+        }
+    }
+
+    private void showGraphics(boolean show) {
+        graphicsShown = show;
+        modsShown = false;
+        driversShown = false;
+        touchShown = false;
+        mainPage.setVisibility(show ? View.GONE : View.VISIBLE);
+        modsPage.setVisibility(View.GONE);
+        driversPage.setVisibility(View.GONE);
+        touchPage.setVisibility(View.GONE);
+        graphicsPage.setVisibility(show ? View.VISIBLE : View.GONE);
+        sv.scrollTo(0, 0); // a page starts at its top (touch mode moves no focus into view)
+        (show ? graphicsFocus : firstFocus).requestFocus();
     }
 
     private android.widget.RadioButton radio(String label) {

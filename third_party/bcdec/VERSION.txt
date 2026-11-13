@@ -1,0 +1,5 @@
+bcdec (single-header BC1-BC7 block decoder), unmodified.
+upstream: https://github.com/iOrange/bcdec
+commit:   80859ed3b7afb1c527a2a99d70c61457bea72d0c (2026-09-02, v0.985)
+licence:  MIT or Unlicense (LICENSE); Somniel uses it under MIT.
+used by:  app/src/main/cpp/nvn/bc_decode.c (CPU decode of BC textures on GPUs without BC, e.g. Mali)

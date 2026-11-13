@@ -16,7 +16,7 @@
 #include "debug_log.h"
 #include "hook.h"
 
-#define NRO_FIRST_BASE 0x40000000ull
+#define NRO_FIRST_BASE g_nro_first_base /* guest.h: 0x40000000 on the Horizon window, base + 0x40000000 on the 4 GiB one */
 #define NRO_STEP       0x02000000ull
 #define NRO_ISLAND_SZ  0x00200000ull
 #define MAX_NROS       32

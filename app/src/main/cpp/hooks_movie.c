@@ -23,11 +23,16 @@
 #include <string.h>
 #include <time.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
 #include <media/NdkMediaFormat.h>
 
 #include "debug_log.h"
 #include "hook.h"
+#include "movies.h"
 #include "nvn/host.h"
 
 enum { ST_OK = 0, ST_UNSUPPORTED = 0x1006, ST_BAD_ARG = 0x100b, ST_NO_OUTPUT = 0x100e, ST_NO_INPUT = 0x1011,
@@ -75,7 +80,48 @@ typedef struct Dec {
     int src_stride, src_slice, src_color, crop_l, crop_t;
     int fmt_known;
     unsigned frames;
+
+    /* Playing the movie's H.264 copy (movies.c) on the hardware decoder instead of the VP9 stream, on devices whose VP9
+     * decoder is software. The game's packets still arrive; each one is answered with the copy's frame of the same
+     * timestamp. sq: the copy's samples in the codec, with the game timestamp each answers (drop: decoded only to reach
+     * a frame after a seek, never shown). */
+    AMediaExtractor *side;
+    int side_fd, side_seek;
+    struct { int64_t sample, guest; int drop; } sq[64];
+    int sq_n;
+
+    /* pacing counters, logged every 5 s while video plays: packets from the game, copy samples fed / decoded only,
+     * frames listed for the game, frames it took, and the time spent copying frames out (ns) */
+    unsigned st_in, st_fed, st_hidden, st_out, st_taken;
+    uint64_t st_copy_ns, st_start_ns;
+    /* timing: packets whose pts went backwards, flushes, and how far behind the newest packet each listed frame is */
+    unsigned st_back, st_flush;
+    int64_t st_last_in_pts, st_lag_sum_us, st_lag_max_us;
 } Dec;
+
+static const char *type_mime(int t);
+
+static uint64_t mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* caller holds d->mu */
+static void stats_tick(Dec *d) {
+    uint64_t now = mono_ns();
+    if (!d->st_start_ns) d->st_start_ns = now;
+    if (now - d->st_start_ns < 5000000000ull) return;
+    double s = (double)(now - d->st_start_ns) / 1e9;
+    som_log("movie: %.1f s of %s%s: game sent %.1f packets/s, fed %.1f/s (%u decoded only), listed %.1f frames/s, game took %.1f/s, "
+            "copy-out %.1f ms/frame; %u packets went back in time, %u flushes; frames listed %.0f ms behind the newest packet "
+            "(max %.0f)", s, type_mime(d->type), d->side ? " (H.264 copy)" : "", d->st_in / s, d->st_fed / s, d->st_hidden,
+            d->st_out / s, d->st_taken / s, d->st_taken ? (double)d->st_copy_ns / 1e6 / d->st_taken : 0.0, d->st_back, d->st_flush,
+            d->st_out ? (double)d->st_lag_sum_us / 1e3 / d->st_out : 0.0, (double)d->st_lag_max_us / 1e3);
+    d->st_in = d->st_fed = d->st_hidden = d->st_out = d->st_taken = d->st_back = d->st_flush = 0;
+    d->st_lag_sum_us = d->st_lag_max_us = 0;
+    d->st_copy_ns = 0, d->st_start_ns = now;
+}
 
 static Dec *g_dec[MAX_DEC];
 static pthread_mutex_t g_dec_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -318,13 +364,90 @@ static void read_format(Dec *d) {
     d->fmt_known = 1;
 }
 
+/* the game's oldest waiting packet is done: its slot is free again (caller holds d->mu) */
+static void in_q_pop(Dec *d) {
+    int slot = d->in_q[0].idx;
+    memmove(d->in_q, d->in_q + 1, (size_t)(--d->n_in_q) * sizeof d->in_q[0]);
+    d->in_free[d->n_in_free++] = slot;
+    dec_signal(d, EV_INPUT);
+}
+
+/* One step of answering the game's oldest packet (pts P) from the H.264 copy: feeds one sample of the copy. Samples
+ * before P (after a seek to the copy's previous keyframe) are decoded but not shown; the sample at P answers the packet.
+ * Called with d->mu held; returns 1 when something was fed. */
+static int side_feed_step(Dec *d) {
+    int64_t P = d->in_q[0].pts;
+    uint32_t flags = d->in_q[0].flags;
+    int size = d->in_q[0].size;
+    if (d->sq_n >= (int)(sizeof d->sq / sizeof d->sq[0])) return 0; /* the codec holds enough: drain first */
+    pthread_mutex_unlock(&d->mu);
+    int fed = 0, answered = 0;
+    if ((flags & FLAG_EOS) && size == 0) {
+        ssize_t ci = AMediaCodec_dequeueInputBuffer(d->mc, 2000);
+        if (ci >= 0) {
+            AMediaCodec_queueInputBuffer(d->mc, (size_t)ci, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+            fed = answered = 1;
+        }
+        pthread_mutex_lock(&d->mu);
+        if (answered) in_q_pop(d);
+        return fed;
+    }
+    int64_t t = AMediaExtractor_getSampleTime(d->side);
+    /* positioned wrong: first packet, after a Flush, the game jumped back, or more than 2 s ahead of the copy */
+    if (d->side_seek || t < 0 || t > P + 40000 || t < P - 2000000) {
+        AMediaExtractor_seekTo(d->side, P, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
+        d->side_seek = 0;
+        t = AMediaExtractor_getSampleTime(d->side);
+    }
+    if (t < 0) { /* the copy has no frame this late: let the packet go unanswered */
+        pthread_mutex_lock(&d->mu);
+        in_q_pop(d);
+        return 1;
+    }
+    ssize_t ci = AMediaCodec_dequeueInputBuffer(d->mc, 2000);
+    if (ci >= 0) {
+        size_t cap = 0;
+        uint8_t *dst = AMediaCodec_getInputBuffer(d->mc, (size_t)ci, &cap);
+        ssize_t n = dst ? AMediaExtractor_readSampleData(d->side, dst, cap) : -1;
+        int drop = t < P - 2000; /* 2 ms of slack: both timelines come from millisecond WebM timestamps */
+        AMediaCodec_queueInputBuffer(d->mc, (size_t)ci, 0, n > 0 ? (size_t)n : 0, (uint64_t)t,
+                                     (!drop && (flags & FLAG_EOS)) ? AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM : 0);
+        AMediaExtractor_advance(d->side);
+        pthread_mutex_lock(&d->mu);
+        d->sq[d->sq_n].sample = t, d->sq[d->sq_n].guest = P, d->sq[d->sq_n].drop = drop;
+        d->sq_n++;
+        d->st_fed++;
+        if (drop) d->st_hidden++;
+        if (!drop) in_q_pop(d);
+        return 1;
+    }
+    pthread_mutex_lock(&d->mu);
+    return 0;
+}
+
+/* the game timestamp of a decoded sample of the copy, and whether to show it (caller holds d->mu) */
+static int side_map_output(Dec *d, int64_t sample, int64_t *guest) {
+    for (int i = 0; i < d->sq_n; i++)
+        if (d->sq[i].sample == sample) {
+            int drop = d->sq[i].drop;
+            *guest = d->sq[i].guest;
+            d->sq_n -= i + 1; /* earlier entries never came out: forget them */
+            memmove(d->sq, d->sq + i + 1, (size_t)d->sq_n * sizeof d->sq[0]);
+            return !drop;
+        }
+    *guest = sample;
+    return 1;
+}
+
 static void *worker_main(void *arg) {
     Dec *d = arg;
     pthread_mutex_lock(&d->mu);
     while (!d->stop) {
         int did = 0;
-        /* feed one waiting input slot */
-        if (d->n_in_q > 0) {
+        /* feed one waiting input slot (from the H.264 copy when there is one) */
+        if (d->side && d->n_in_q > 0) {
+            did |= side_feed_step(d);
+        } else if (d->n_in_q > 0) {
             pthread_mutex_unlock(&d->mu);
             ssize_t ci = AMediaCodec_dequeueInputBuffer(d->mc, 2000);
             pthread_mutex_lock(&d->mu);
@@ -369,6 +492,12 @@ static void *worker_main(void *arg) {
                     read_format(d);
                     dec_signal(d, EV_FORMAT);
                 }
+                int64_t guest_pts = info.presentationTimeUs;
+                if (d->side && !side_map_output(d, info.presentationTimeUs, &guest_pts) &&
+                    !(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)) {
+                    AMediaCodec_releaseOutputBuffer(d->mc, (size_t)oi, false); /* decoded to reach a frame: not shown */
+                    continue;
+                }
                 size_t len = 0;
                 uint8_t *src = AMediaCodec_getOutputBuffer(d->mc, (size_t)oi, &len);
                 size_t need = d->video ? out_bytes(d) : (size_t)(info.size > 0 ? info.size : 0);
@@ -394,11 +523,17 @@ static void *worker_main(void *arg) {
                 }
                 AMediaCodec_releaseOutputBuffer(d->mc, (size_t)oi, false);
                 d->out_size[free_slot] = (int)need;
-                d->out_pts[free_slot] = info.presentationTimeUs;
+                d->out_pts[free_slot] = guest_pts;
                 d->out_flags[free_slot] = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) ? FLAG_EOS : 0;
                 if (d->out_flags[free_slot] & FLAG_EOS) d->eos_out = 1;
                 d->out_state[free_slot] = 1;
                 d->out_ready[d->n_out_ready++] = free_slot;
+                if (d->video) {
+                    int64_t lag = d->st_last_in_pts - guest_pts;
+                    d->st_lag_sum_us += lag;
+                    if (lag > d->st_lag_max_us) d->st_lag_max_us = lag;
+                    d->st_out++, stats_tick(d);
+                }
                 if (d->frames++ < 3 || d->frames % 300 == 0 || d->eos_out)
                     som_log("movie: %s output %u pts %lld size %zu%s", type_mime(d->type), d->frames,
                             (long long)info.presentationTimeUs, need, d->eos_out ? " (end of stream)" : "");
@@ -447,9 +582,70 @@ static void slots_reset(Dec *d) {
     d->eos_out = 0;
 }
 
+static void side_close(Dec *d) {
+    if (d->side) AMediaExtractor_delete(d->side);
+    if (d->side_fd > 0) close(d->side_fd);
+    d->side = NULL, d->side_fd = 0, d->sq_n = 0;
+}
+
+/* The H.264 copy of the movie the game is reading, on the hardware decoder (in place of a software VP9 decoder).
+ * Returns 1 with d->mc configured. */
+static int side_open(Dec *d, const char *path, const char *name, int64_t want_dur) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    off_t len = lseek(fd, 0, SEEK_END);
+    AMediaExtractor *ex = AMediaExtractor_new();
+    AMediaFormat *tf = NULL;
+    const char *mime = NULL;
+    if (ex && AMediaExtractor_setDataSourceFd(ex, fd, 0, len) == AMEDIA_OK)
+        for (size_t t = 0; t < AMediaExtractor_getTrackCount(ex) && !tf; t++) {
+            AMediaFormat *f = AMediaExtractor_getTrackFormat(ex, t);
+            if (AMediaFormat_getString(f, AMEDIAFORMAT_KEY_MIME, &mime) && !strncmp(mime, "video/", 6)) {
+                AMediaExtractor_selectTrack(ex, t);
+                tf = f;
+            } else {
+                AMediaFormat_delete(f);
+            }
+        }
+    int64_t dur = 0;
+    if (tf && want_dur > 0 && AMediaFormat_getInt64(tf, AMEDIAFORMAT_KEY_DURATION, &dur) &&
+        (dur - want_dur > 200000 || want_dur - dur > 200000)) { /* another movie the game also read: not this one */
+        AMediaFormat_delete(tf);
+        AMediaExtractor_delete(ex);
+        close(fd);
+        return 0;
+    }
+    AMediaCodec *mc = tf ? AMediaCodec_createDecoderByType(mime) : NULL;
+    if (tf) {
+        AMediaFormat_setInt32(tf, AMEDIAFORMAT_KEY_COLOR_FORMAT, 21); /* NV12 into byte buffers, as for VP9 */
+        /* The copies have no B-frames, but the stream does not say so, and an H.264 decoder then holds frames back for
+         * reordering: frames came out ~400 ms (12 frames) after their packet, the game's player (which reads ~400 ms
+         * ahead) found them late, dropped two thirds and flushed every second. Low-latency mode outputs each frame as it
+         * is decoded. */
+        AMediaFormat_setInt32(tf, "low-latency", 1);
+    }
+    if (!mc || AMediaCodec_configure(mc, tf, NULL, NULL, 0) != AMEDIA_OK) {
+        som_log("movie: the H.264 copy of %s did not open (%s): playing the VP9 stream", name, mc ? "configure failed" : "no track or decoder");
+        if (mc) AMediaCodec_delete(mc);
+        if (tf) AMediaFormat_delete(tf);
+        if (ex) AMediaExtractor_delete(ex);
+        close(fd);
+        return 0;
+    }
+    char *cn = NULL;
+    AMediaCodec_getName(mc, &cn);
+    som_log("movie: playing %s from its H.264 copy on %s (the VP9 packets only time it)", name, cn ? cn : "?");
+    if (cn) AMediaCodec_releaseName(mc, cn);
+    AMediaFormat_delete(tf);
+    d->mc = mc, d->side = ex, d->side_fd = fd, d->side_seek = 1, d->sq_n = 0;
+    d->src_stride = d->width, d->src_slice = d->height, d->src_color = 21;
+    return 1;
+}
+
 static void dec_free(Dec *d) {
     worker_stop(d);
     pump_forget(d->events, 4);
+    side_close(d);
     if (d->mc) {
         if (d->started) AMediaCodec_stop(d->mc);
         AMediaCodec_delete(d->mc);
@@ -553,6 +749,17 @@ static void dec_configure(GuestCtx *c) {
             som_log("movie: %s %s: %d bytes", mime, key, b->size);
         }
     }
+    if (d->type == TYPE_VP9 && movies_vp9_is_software()) { /* the H.264 copy of this movie, on the hardware decoder */
+        static char sp[8][MOVIES_PATH_N], sn[8][MOVIES_NAME_N];
+        int n = movies_recent_copies(sp, sn, 8);
+        for (int k = 0; k < n; k++)
+            if (side_open(d, sp[k], sn[k], dur)) {
+                AMediaFormat_delete(f);
+                d->configured = 1;
+                return ret_x(c, ST_OK);
+            }
+        som_log("movie: no converted copy matches this movie (%d recent copies, duration %lld us): software VP9", n, (long long)dur);
+    }
     d->mc = AMediaCodec_createDecoderByType(mime);
     media_status_t s = d->mc ? AMediaCodec_configure(d->mc, f, NULL, NULL, 0) : AMEDIA_ERROR_UNSUPPORTED;
     char *name = NULL;
@@ -623,6 +830,7 @@ static void dec_reset(GuestCtx *c) {
         AMediaCodec_delete(d->mc);
         d->mc = NULL;
     }
+    side_close(d);
     d->started = d->configured = d->fmt_known = 0;
     pthread_mutex_lock(&d->mu);
     slots_reset(d);
@@ -639,6 +847,12 @@ static void dec_flush(GuestCtx *c) {
     if (d->mc && d->started) AMediaCodec_flush(d->mc);
     pthread_mutex_lock(&d->mu);
     slots_reset(d);
+    d->sq_n = 0, d->side_seek = 1; /* the copy is repositioned at the next packet */
+    if (d->video) {
+        d->st_flush++;
+        static int nf;
+        if (nf++ < 12) som_log("movie: Flush after packet pts %lld", (long long)d->st_last_in_pts);
+    }
     pthread_mutex_unlock(&d->mu);
     if (was && pthread_create(&d->worker, NULL, worker_main, d) == 0) d->worker_on = 1;
     dec_signal(d, EV_INPUT);
@@ -686,7 +900,17 @@ static void dec_send_input(GuestCtx *c) {
     if (!d || idx < 0 || idx >= NIN || off < 0 || size < 0 || (size_t)off + (size_t)size > IN_CAP) return ret_x(c, ST_BAD_ARG);
     static int n;
     if (n++ < 3 || (flags & FLAG_EOS)) som_log("movie: %s input %d bytes pts %lld flags 0x%x", type_mime(d->type), size, (long long)pts, flags);
+    if (d->video) movies_playback_tick(); /* the movie converter stays out of the way while a movie plays */
     pthread_mutex_lock(&d->mu);
+    if (d->video) {
+        d->st_in++;
+        if (size > 0 && pts <= d->st_last_in_pts && d->st_in > 1) {
+            static int nb;
+            if (nb++ < 12) som_log("movie: packet pts %lld after %lld (back in time)", (long long)pts, (long long)d->st_last_in_pts);
+            d->st_back++;
+        }
+        if (size > 0) d->st_last_in_pts = pts;
+    }
     if (d->n_in_q < NIN) {
         d->in_q[d->n_in_q].idx = idx, d->in_q[d->n_in_q].off = off, d->in_q[d->n_in_q].size = size;
         d->in_q[d->n_in_q].pts = pts, d->in_q[d->n_in_q].flags = flags;
@@ -778,7 +1002,9 @@ static void dec_get_output_size(GuestCtx *c) {
 
 static uint32_t copy_output(Dec *d, int idx, GuestBuffer *b) {
     if (idx < 0 || idx >= NOUT || !b) return ST_BAD_ARG;
+    uint64_t t0 = mono_ns();
     pthread_mutex_lock(&d->mu);
+    if (d->video) d->st_taken++;
     int n = d->out_size[idx];
     uint32_t st = ST_OK;
     b->offset = 0, b->size = 0;
@@ -802,6 +1028,7 @@ static uint32_t copy_output(Dec *d, int idx, GuestBuffer *b) {
             }
         }
     }
+    if (d->video) d->st_copy_ns += mono_ns() - t0;
     pthread_mutex_unlock(&d->mu);
     return st;
 }

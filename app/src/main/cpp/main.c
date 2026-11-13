@@ -375,6 +375,15 @@ static bool init_vulkan(Gfx *g) {
         VkPhysicalDeviceProperties pp;
         vkGetPhysicalDeviceProperties(g->phys, &pp);
         g_vkr.max_aniso = pf.samplerAnisotropy ? pp.limits.maxSamplerAnisotropy : 1.0f;
+        g_vkr.sbuf_align = (uint32_t)pp.limits.minStorageBufferOffsetAlignment;
+        VkPhysicalDeviceSubgroupProperties sgp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 pp2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sgp};
+        vkGetPhysicalDeviceProperties2(g->phys, &pp2);
+        g_vkr.subgroup_size = sgp.subgroupSize;
+        g_vkr.clip_distance = pf.shaderClipDistance;
+        som_log("Vulkan device: %s, api %u.%u.%u, subgroup size %u, storage buffer alignment %u, BC %s, clip distance %s", pp.deviceName,
+                VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion), VK_API_VERSION_PATCH(pp.apiVersion),
+                g_vkr.subgroup_size, g_vkr.sbuf_align, pf.textureCompressionBC ? "yes" : "NO", pf.shaderClipDistance ? "yes" : "NO");
     }
     __atomic_store_n(&g_vkr.ready, 1, __ATOMIC_RELEASE);
 
@@ -439,6 +448,8 @@ static bool draw_frame(Gfx *g, double t) {
     if (g_spike_mode && __atomic_load_n(&som_gfx_presents, __ATOMIC_RELAXED)) {
         /* the game is presenting: show the colour it last cleared the presented texture to (skeleton display) */
         col = (VkClearColorValue){{som_gfx_color[0], som_gfx_color[1], som_gfx_color[2], 1.0f}};
+        extern int som_keep_aspect(void);
+        if (som_keep_aspect()) col = (VkClearColorValue){{0.0f, 0.0f, 0.0f, 1.0f}}; /* the letterbox bars */
     } else if (g_spike_mode && t < 120.0) {
         /* boot: navy behind the Java splash overlay (sRGB swapchain, so linear values of #1B2545), never the colour cycle */
         col = (VkClearColorValue){{0.011f, 0.018f, 0.060f, 1.0f}};
@@ -472,9 +483,13 @@ static bool draw_frame(Gfx *g, double t) {
     sub.pCommandBuffers = &cb;
     sub.signalSemaphoreCount = 1;
     sub.pSignalSemaphores = &g->render_done[idx];
+    static uint64_t wl_sub_ns, wl_pres_ns, wl_n, wl_t0;
+    struct timespec wa, wb, wc;
+    clock_gettime(CLOCK_MONOTONIC, &wa);
     pthread_mutex_lock(&g_vkr.qmu);
     VkResult sr = vkQueueSubmit(g->queue, 1, &sub, g->fence[f]);
     pthread_mutex_unlock(&g_vkr.qmu);
+    clock_gettime(CLOCK_MONOTONIC, &wb);
     if (!vk_ok(sr, "vkQueueSubmit")) return false;
 
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -486,6 +501,18 @@ static bool draw_frame(Gfx *g, double t) {
     pthread_mutex_lock(&g_vkr.qmu);
     r = vkQueuePresentKHR(g->queue, &pi);
     pthread_mutex_unlock(&g_vkr.qmu);
+    clock_gettime(CLOCK_MONOTONIC, &wc);
+    {   /* how long the window thread holds the queue lock (the renderer's submit waits for it) */
+        uint64_t a = (uint64_t)wa.tv_sec * 1000000000ull + (uint64_t)wa.tv_nsec, b = (uint64_t)wb.tv_sec * 1000000000ull + (uint64_t)wb.tv_nsec;
+        uint64_t cc = (uint64_t)wc.tv_sec * 1000000000ull + (uint64_t)wc.tv_nsec;
+        wl_sub_ns += b - a, wl_pres_ns += cc - b, wl_n++;
+        if (!wl_t0) wl_t0 = cc;
+        if (cc - wl_t0 >= 5000000000ull) {
+            som_log("window: %.1f presents/s, queue lock held per present: submit %.2f ms, present %.2f ms", wl_n / ((cc - wl_t0) / 1e9),
+                    wl_sub_ns / 1e6 / wl_n, wl_pres_ns / 1e6 / wl_n);
+            wl_sub_ns = wl_pres_ns = wl_n = 0, wl_t0 = cc;
+        }
+    }
     g->frame++;
     /* SUBOPTIMAL is expected every frame: we present with IDENTITY on a rotated panel on purpose */
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) return false;
@@ -761,7 +788,13 @@ int main(int argc, char **argv) {
     Gfx g;
     memset(&g, 0, sizeof g);
 
-    som_log_init(SDL_GetAndroidInternalStoragePath());
+    {   /* <external files>/log_external: write somniel.log (and the other logs) next to the saves, where adb can read them
+         * on a release build (no run-as) */
+        const char *log_dir = SDL_GetAndroidInternalStoragePath(), *e = SDL_GetAndroidExternalStoragePath();
+        char f[512];
+        if (e && snprintf(f, sizeof f, "%s/log_external", e) > 0 && access(f, F_OK) == 0) log_dir = e;
+        som_log_init(log_dir);
+    }
     som_log("Somniel M0 starting (built %s %s)", __DATE__, __TIME__);
     som_debug_socket_start();
 
@@ -830,9 +863,17 @@ int main(int argc, char **argv) {
             case SDL_EVENT_FINGER_MOTION:
             case SDL_EVENT_FINGER_UP:
             case SDL_EVENT_FINGER_CANCELED:
-                som_hid_touch((int64_t)e.tfinger.fingerID, e.tfinger.x, e.tfinger.y,
+            {   /* screen fractions to the picture's own (letterboxed by the Aspect ratio option: vkr_blit_present) */
+                extern void vkr_present_rect(float r[4]);
+                float r[4];
+                vkr_present_rect(r);
+                float tx = r[2] > 0 ? (e.tfinger.x - r[0]) / r[2] : e.tfinger.x, ty = r[3] > 0 ? (e.tfinger.y - r[1]) / r[3] : e.tfinger.y;
+                tx = tx < 0 ? 0 : tx > 1 ? 1 : tx;
+                ty = ty < 0 ? 0 : ty > 1 ? 1 : ty;
+                som_hid_touch((int64_t)e.tfinger.fingerID, tx, ty,
                               e.type == SDL_EVENT_FINGER_DOWN ? 0 : e.type == SDL_EVENT_FINGER_MOTION ? 1 : 2,
                               (int64_t)SDL_GetTicksNS());
+            }
                 break;
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                 if (!g_background && g.swapchain) {
@@ -868,6 +909,18 @@ int main(int argc, char **argv) {
         }
 
         Uint64 now = SDL_GetPerformanceCounter();
+        {   /* Present only when the game has a new frame (or every 100 ms, for the overlay). vkQueuePresentKHR blocks
+             * ~17 ms on the Mali-G68 while holding the queue lock the renderer needs for its own submit: presenting the
+             * same image at the display rate (~50 times a second) kept the renderer waiting ~16 ms per game frame. */
+            static uint64_t drawn_presents;
+            static Uint64 drawn_at;
+            uint64_t p = __atomic_load_n(&som_gfx_presents, __ATOMIC_RELAXED);
+            if (g_spike_mode && p && p == drawn_presents && now - drawn_at < freq / 10) {
+                SDL_Delay(2);
+                continue;
+            }
+            drawn_presents = p, drawn_at = now;
+        }
         double t = (double)(now - start) / (double)freq;
         Uint64 cpu0 = now;
         pthread_mutex_lock(&g_gfx_mu);

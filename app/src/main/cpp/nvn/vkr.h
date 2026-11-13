@@ -18,6 +18,9 @@ typedef struct VkrCtx {
     pthread_mutex_t qmu; /* the queue is shared with the window thread */
     int depth_clip_control;
     float max_aniso; /* 1 without the samplerAnisotropy feature */
+    uint32_t subgroup_size; /* device subgroup size (Adreno 740: 64, Mali Valhall: 16); 0 until the device exists */
+    uint32_t sbuf_align;    /* minStorageBufferOffsetAlignment (logged only: the translator always gets 64, see shader_cache.c) */
+    int clip_distance;      /* shaderClipDistance (Adreno yes, Mali-G68 no: the translator then leaves gl_ClipDistance out) */
     int pipe_cache_control; /* VK_EXT_pipeline_creation_cache_control: ask the cache only, without compiling */
 } VkrCtx;
 extern VkrCtx g_vkr; /* filled by main.c once the device exists */
@@ -40,7 +43,9 @@ void vkr_sampler_register(int id, const samp_par *s);
 void vkr_submit_begin(void);
 void vkr_submit_end(void);
 void vkr_op(const op_hdr *h, const void *payload);
-void vkr_present(const tex_t *t);
+/* crop: the window's crop rectangle (x, y, w, h; nvnWindowSetCrop): the part of the texture that is the picture. The
+ * handheld profile renders 1280x720 into the top-left of a 1920x1080 window texture. NULL or w/h 0: the whole texture. */
+void vkr_present(const tex_t *t, const int crop[4]);
 /* the game's real frame rate over the last second, from the times of its presents (overlay.c) */
 typedef struct { uint32_t frames; float fps, avg_ms, max_ms; } VkrFrameStats;
 void vkr_frame_stats(VkrFrameStats *out);

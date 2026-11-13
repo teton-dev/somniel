@@ -11,9 +11,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "bc_decode.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_tex.h"
+#include "perf_hint.h"
 #include "shader_cache.h"
 #include "../telemetry.h"
 
@@ -116,6 +118,9 @@ static uint64_t pf_begin; /* start of this submit */
 #define PF_T0() uint64_t pf_t0_ = now_ns()
 #define PF_T1(k) (PS.t[k] += now_ns() - pf_t0_)
 
+/* <data>/vkr_skip_pass: "N" or "LO HI": pass indices (as the GPU pass timing numbers them) whose draws are left out
+ * (-2 every pass, -3 the passes into a presented window image, absent -1): measures what a pass really costs on a GPU whose per-pass timestamps overlap (Mali). */
+static int g_skip_pass = -1, g_skip_hi = -1, pass_no = -1;
 static int flags_cur = -1;
 static int flags_refresh(void) {
     static int f = -1;
@@ -133,6 +138,15 @@ static int flags_refresh(void) {
         }
         if (v != f) som_log("vkr: flags %d", v);
         f = v;
+        snprintf(path, sizeof path, "%s/vkr_skip_pass", som_data_dir());
+        int sp = -1, hi = -1;
+        if ((fp = fopen(path, "r"))) {
+            if (fscanf(fp, "%d %d", &sp, &hi) < 1) sp = -1;
+            fclose(fp);
+        }
+        if (hi < sp) hi = sp;
+        if (sp != g_skip_pass || hi != g_skip_hi) som_log("vkr: skip pass %d-%d", sp, hi);
+        g_skip_pass = sp, g_skip_hi = hi;
     }
     return flags_cur = f;
 }
@@ -146,11 +160,16 @@ static uint32_t find_mem(uint32_t bits, VkMemoryPropertyFlags want) {
 }
 
 /* ---------------------------------------------------------------- upload ring */
-#define RING_BYTES (96u << 20)
+/* 96 MB per frame context; 48 MB on Mali GPUs (the low-memory phones): on the Galaxy A17 a frame uses ~3 MB and loading
+ * into a map peaked at 36 MB (texture uploads; 16 MB with Texture size Half). A texture that does not fit is uploaded
+ * again at its next use, when the ring is empty. Set once, before the rings are made. */
+static uint32_t g_ring_bytes = 96u << 20;
+#define RING_BYTES g_ring_bytes
 static VkBuffer ring_buf;
 static VkDeviceMemory ring_mem;
 static uint8_t *ring_ptr;
 static uint64_t ring_off;
+static uint64_t ring_peak, ring_full; /* the most one submit used, and allocations refused, since the last status line */
 
 /* Two frame contexts, used in turn: a submit is not waited for. Its command buffer, upload ring and descriptor pool
  * stay untouched until the submit after the next begins, which first waits for it (normally long done), so the GPU
@@ -171,6 +190,12 @@ static int fr_cur;
 static int ring_init1(void);
 static int ring_init(void) {
     if (FR[0].ring_buf) return 1;
+    {
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(g_vkr.phys, &pp);
+        if (pp.vendorID == 0x13B5) g_ring_bytes = 48u << 20; /* ARM (Mali) */
+        som_log("vkr: upload ring %u MB per frame context", g_ring_bytes >> 20);
+    }
     for (int k = 0; k < NFRAME; k++) {
         ring_buf = VK_NULL_HANDLE;
         if (!ring_init1()) return 0;
@@ -200,8 +225,9 @@ static int ring_init1(void) {
 /* n bytes at the given alignment; NULL (and *off unset) when the ring is full */
 static uint8_t *ring_alloc(uint64_t n, uint64_t align, uint64_t *off) {
     uint64_t o = (ring_off + align - 1) & ~(align - 1);
-    if (o + n > RING_BYTES) return NULL;
+    if (o + n > RING_BYTES) { ring_full++; return NULL; }
     ring_off = o + n;
+    if (ring_off > ring_peak) ring_peak = ring_off;
     *off = o;
     return ring_ptr + o;
 }
@@ -253,15 +279,19 @@ typedef struct Img {
     VkImageAspectFlags aspect;
     int inited, loaded, is_rt, is_depth;
     int linear_ok; /* the format supports linear filtering (depth formats often do not) */
+    VkFormat bc;   /* the texture's BC format when the GPU has no BC (Mali): fmt is then its decoded format (bc_decode.c) */
+    volatile int presented; /* the game has presented it (a window texture): only its crop is ever shown (pass_setup) */
     const tex_t *t;
     SubView *sv; /* single level and layer views (render targets), kept for the image's life */
     TexView *tv; /* sampled through a texture view (nvnTexturePoolRegisterTexture with a view) */
     VkComponentMapping comp; /* the texture's own swizzle, as in view */
+    uint32_t drop; /* top mip levels left out (Texture size option): image level L is the texture's level L + drop */
     uint64_t bytes;
     struct Img *next;
 } Img;
 
 static uint64_t g_img_live, g_img_bytes, g_img_freed;
+static int present_crop[4]; /* the window crop of the last present (x, y, w, h), set by vkr_present */
 static Img *img_tab[4096];
 static pthread_mutex_t img_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -287,6 +317,21 @@ static Img *img_get(const tex_t *t) {
         if (d->format >= 0 && d->format < 0x9D && !warned[d->format]++) som_log("vkr: texture format %#x has no Vulkan format", d->format);
         return NULL;
     }
+    /* BC on a GPU without BC (the Mali-G68): an uncompressed image, decoded on the CPU at upload (img_load). The Adreno
+     * supports every BC format, so this is never taken there. */
+    VkFormat bc_src = VK_FORMAT_UNDEFINED;
+    if (bc_fallback_format(f.vk) != VK_FORMAT_UNDEFINED) {
+        VkFormatProperties p0;
+        vkGetPhysicalDeviceFormatProperties(g_vkr.phys, f.vk, &p0);
+        if (!(p0.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+            static int noted[0x9D];
+            if (d->format >= 0 && d->format < 0x9D && !noted[d->format]++)
+                som_log("vkr: texture format %#x (Vulkan %d) is not supported by this GPU: decoded on the CPU to Vulkan %d", d->format,
+                        (int)f.vk, (int)bc_fallback_format(f.vk));
+            bc_src = f.vk;
+            f.vk = bc_fallback_format(f.vk);
+        }
+    }
     nvn_texlayout L;
     nvn_tex_layout(d, &L);
     int cube = d->target == NVN_TEXTURE_TARGET_CUBEMAP || d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
@@ -297,6 +342,7 @@ static Img *img_get(const tex_t *t) {
     i->serial = t->serial;
     i->t = t;
     i->fmt = f.vk;
+    i->bc = bc_src;
     i->w = d->width ? d->width : 1;
     i->h = one ? 1 : (d->height ? d->height : 1);
     i->depth = three ? (d->depth ? d->depth : 1) : 1;
@@ -306,6 +352,24 @@ static Img *img_get(const tex_t *t) {
         if (i->depth > m) m = i->depth;
         while (m > 1) m >>= 1, maxl++;
         if (i->levels > maxl) i->levels = maxl;
+    }
+    {   /* Texture size (sidebar Graphics, game_patches.c): large sampled-only textures with mipmaps lose their top 1-2
+         * levels. Sampling picks levels by the image's own size, so the picture just loses detail; views and copies
+         * shift by drop. Never a render target or GPU-written texture: no display, image, compressible, linear or
+         * linear-render-target flag (Unity's render textures are compressible), no depth, 3D or multisample. */
+        extern int som_tex_size(void);
+        int q = som_tex_size();
+        uint32_t lo = i->w < i->h ? i->w : i->h, hi = i->w > i->h ? i->w : i->h;
+        if (q > 0 && !(d->flags & 0x5F) && !f.depth && !f.stencil && !three && d->samples <= 1 && i->levels >= 2 && hi >= 512) {
+            uint32_t dr = (uint32_t)q < i->levels - 1 ? (uint32_t)q : i->levels - 1;
+            while (dr && (lo >> dr) < 64) dr--;
+            if (dr) {
+                static unsigned nlog;
+                if (nlog++ < 6) som_log("vkr: texture size: serial %llu %ux%u (%u levels, flags %#x) drops %u top level(s)",
+                                        (unsigned long long)t->serial, i->w, i->h, i->levels, d->flags, dr);
+                i->drop = dr, i->w = mip(i->w, dr), i->h = mip(i->h, dr), i->levels -= dr;
+            }
+        }
     }
     i->layers = cube ? 6 * (d->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && d->depth ? d->depth / 6 ? d->depth / 6 : 1 : 1)
                      : array ? (d->depth ? d->depth : 1) : 1;
@@ -332,6 +396,16 @@ static Img *img_get(const tex_t *t) {
     vkGetPhysicalDeviceFormatProperties(g_vkr.phys, f.vk, &fp);
     VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
     i->linear_ok = (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    if (!ff) {
+        /* The GPU has no support at all for this format (BC on the Mali-G68). Its driver still creates the image, then
+         * crashes in vkCmdCopyBufferToImage (format_query_internal::create_integer_pfs). Leave the texture out: it reads
+         * as the dummy image (black) until a decode fallback exists. Never taken on the Adreno (BC supported). */
+        static int warned[0x9D];
+        if (d->format >= 0 && d->format < 0x9D && !warned[d->format]++)
+            som_log("vkr: texture format %#x (Vulkan %d) is not supported by this GPU: such textures are left out", d->format, (int)f.vk);
+        free(i);
+        return NULL;
+    }
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
     if (i->is_depth && (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
@@ -467,7 +541,8 @@ static VkSampler sampler_make(const samp_par *p, int shadow, int nearest) {
     si.addressModeU = wrap_of(p->ws);
     si.addressModeV = wrap_of(p->wt);
     si.addressModeW = wrap_of(p->wr);
-    si.mipLodBias = p->lod_bias;
+    extern float som_tex_lod_bias(void); /* game_patches.c: the texture sharpness option (+0, +0.5, +1) */
+    si.mipLodBias = p->lod_bias + som_tex_lod_bias();
     si.minLod = p->lod_min < 0 ? 0 : p->lod_min;
     si.maxLod = p->lod_max >= 1000.0f ? VK_LOD_CLAMP_NONE : p->lod_max < si.minLod ? si.minLod : p->lod_max;
     if (p->minf < 2) si.minLod = 0, si.maxLod = 0.25f; /* NEAREST / LINEAR: no mipmapping, the base level only */
@@ -525,6 +600,11 @@ static VkImageView tex_view(Img *i, const view_t *v) {
     int target = v->set_target ? v->target : i->t->d.target;
     uint32_t bl = v->set_levels ? v->base_level : 0, nlv = v->set_levels && v->nlevels ? v->nlevels : i->levels;
     uint32_t ml = v->set_layers ? v->min_layer : 0, nly = v->set_layers && v->nlayers ? v->nlayers : i->layers;
+    if (i->drop && v->set_levels) { /* levels the image left out start at its level 0 */
+        uint32_t cut = bl < i->drop ? i->drop - bl : 0;
+        bl = bl > i->drop ? bl - i->drop : 0;
+        nlv = nlv > cut ? nlv - cut : 1;
+    }
     if (bl >= i->levels) bl = i->levels - 1;
     if (bl + nlv > i->levels) nlv = i->levels - bl;
     if (ml >= i->layers) ml = i->layers - 1;
@@ -923,6 +1003,8 @@ static void end_pass(void) {
     if (R.in_pass == 2) pass_open(); /* only clears: the pass still has to run for them */
     vkCmdEndRenderPass(R.cb);
     gp_pass_end();
+    /* A narrower barrier here (attachment writes -> fragment-stage and later only, letting the next pass's vertex work
+     * overlap) was tried on the Mali-G68 (2026-11-11): it left persistent edge artifacts in the picture. Keep the full one. */
     barrier_all(R.cb);
     R.in_pass = 0;
     cap_snap();
@@ -1177,21 +1259,26 @@ static void cap_write(void) {
     if (!--cap_left) som_log("cap: done (%u submits)", cap_submit);
 }
 
-/* ---- GPU pass timing (vkr_flags 1048576): a timestamp before each pass begins and after it ends, plus the submit's
+/* ---- GPU pass timing (vkr_flags 33554432; it was 1048576, which is also a depth-test experiment): a timestamp before each pass begins and after it ends, plus the submit's
  * start and end, read back when the frame context comes round again (its fence was waited for); every perf window logs
  * the GPU time per frame and the costliest passes by their position in the frame (the hub's 39 passes come in the same
  * order every frame). */
 #define GP_MAX 160
 typedef struct { uint32_t w, h, draws, nc, clr; VkFormat c0, d; char fs[9]; } GpMeta;
-static struct { VkQueryPool qp; int on, n; GpMeta m[GP_MAX]; } GP[NFRAME];
-static struct { double sum[GP_MAX]; GpMeta m[GP_MAX]; double frame, passes; uint32_t frames, maxn; } GW;
+static struct { VkQueryPool qp; int on, full, n; GpMeta m[GP_MAX]; } GP[NFRAME]; /* full: per-pass timing too */
+static int64_t gp_last_gpu_ns; /* the last collected submit's GPU time (start to end), for the ADPF hint */
+static struct { double sum[GP_MAX]; GpMeta m[GP_MAX]; double frame, passes, gap; uint32_t frames, maxn, gaps; } GW;
+static uint64_t gp_prev_end; /* the previous collected submit's end timestamp: the GPU's idle gap before the next */
 static int gp_cur = -1; /* index of the open pass's slot in GP[fr_cur], -1 none */
 static double gp_tick_ns;
 
 static void gp_submit_begin(void) {
     GP[fr_cur].on = 0;
     gp_cur = -1;
-    if (!(vkr_flags() & 1048576)) return;
+    pass_no = -1;
+    /* the submit's start and end alone when only the ADPF hint (perf_hint.c) needs the GPU time */
+    int full = (vkr_flags() & 33554432) != 0;
+    if (!full && !perf_hint_active()) return;
     if (!GP[fr_cur].qp) {
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1204,10 +1291,11 @@ static void gp_submit_begin(void) {
     vkCmdResetQueryPool(R.cb, GP[fr_cur].qp, 0, 2 + 2 * GP_MAX);
     vkCmdWriteTimestamp(R.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, GP[fr_cur].qp, 0);
     GP[fr_cur].on = 1;
+    GP[fr_cur].full = full;
     GP[fr_cur].n = 0;
 }
 static void gp_pass_begin(uint32_t clr) {
-    if (!GP[fr_cur].on || GP[fr_cur].n >= GP_MAX) return;
+    if (!GP[fr_cur].on || !GP[fr_cur].full || GP[fr_cur].n >= GP_MAX) return;
     int i = GP[fr_cur].n++;
     GpMeta *m = &GP[fr_cur].m[i];
     memset(m, 0, sizeof *m);
@@ -1236,7 +1324,11 @@ static void gp_collect(void) {
     uint64_t t[2 + 2 * GP_MAX];
     if (vkGetQueryPoolResults(g_vkr.dev, GP[fr_cur].qp, 0, 2 + 2 * (uint32_t)n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
         return;
+    gp_last_gpu_ns = t[1] > t[0] ? (int64_t)((double)(t[1] - t[0]) * gp_tick_ns) : 0;
+    if (!GP[fr_cur].full) return;
     GW.frame += (double)(t[1] - t[0]) * gp_tick_ns;
+    if (gp_prev_end && t[0] > gp_prev_end && t[0] - gp_prev_end < (uint64_t)(1e9 / gp_tick_ns)) GW.gap += (double)(t[0] - gp_prev_end) * gp_tick_ns, GW.gaps++;
+    gp_prev_end = t[1];
     for (int i = 0; i < n; i++) {
         double d = t[3 + 2 * i] > t[2 + 2 * i] ? (double)(t[3 + 2 * i] - t[2 + 2 * i]) * gp_tick_ns : 0;
         GW.sum[i] += d, GW.passes += d;
@@ -1248,8 +1340,15 @@ static void gp_collect(void) {
 static void gp_report(void) {
     if (!GW.frames) return;
     double f = GW.frames;
-    som_log("vkr: gpu time per frame %.2f ms (in passes %.2f ms, %u passes), over %u frames", GW.frame / 1e6 / f, GW.passes / 1e6 / f,
-            GW.maxn, GW.frames);
+    /* the GPU clock where the kernel shows it (Samsung Exynos: /sys/kernel/gpu/gpu_clock in kHz) */
+    int khz = 0;
+    FILE *cf = fopen("/sys/kernel/gpu/gpu_clock", "r");
+    if (cf) {
+        if (fscanf(cf, "%d", &khz) != 1) khz = 0;
+        fclose(cf);
+    }
+    som_log("vkr: gpu time per frame %.2f ms (in passes %.2f ms, %u passes), idle before it %.2f ms, over %u frames, gpu clock %d MHz",
+            GW.frame / 1e6 / f, GW.passes / 1e6 / f, GW.maxn, GW.gaps ? GW.gap / 1e6 / GW.gaps : -1.0, GW.frames, khz / 1000);
     for (int k = 0; k < 14; k++) {
         int best = -1;
         for (uint32_t i = 0; i < GW.maxn; i++)
@@ -1277,6 +1376,7 @@ static void pass_open(void) {
     bi.renderArea = (VkRect2D){{0, 0}, {R.rt_w, R.rt_h}};
     bi.clearValueCount = R.pclear ? nv : 0;
     bi.pClearValues = cv;
+    pass_no++;
     gp_pass_begin(R.pclear);
     vkCmdBeginRenderPass(R.cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     if (R.pclear) PS.n_lclear++;
@@ -1302,6 +1402,12 @@ static int pass_setup(int lazy) {
     uint32_t nv = 0;
     for (int i = 0; i < R.n_color; i++) {
         if (!R.color[i]) return 0;
+        if (R.color[i]->drop) { /* a reduced texture (Texture size) cannot be a render target: should not happen */
+            static int warned;
+            if (warned++ < 8) som_log("vkr: texture size: reduced texture serial %llu bound as a render target: pass skipped",
+                                      (unsigned long long)R.color[i]->serial);
+            return 0;
+        }
         img_init(R.color[i]);
         R.color[i]->is_rt = 1;
         views[nv++] = sub_view(R.color[i], R.color_level[i], R.color_layer[i]);
@@ -1323,6 +1429,21 @@ static int pass_setup(int lazy) {
     if (R.depth) {
         if (R.depth->w < R.rt_w) R.rt_w = R.depth->w;
         if (R.depth->h < R.rt_h) R.rt_h = R.depth->h;
+    }
+    {   /* Handheld profile: the game renders its 1280x720 picture into the top-left of a 1920x1080 window texture and
+         * only that crop is shown (vkr_blit_present). A pass into a window texture then covers just the crop: on a tiler
+         * the render area is what gets loaded, shaded and stored (the final 1080p pass was ~10 ms of GPU time on the
+         * Mali-G68). Docked, or with a crop not at the origin, nothing changes. */
+        extern int som_handheld_profile(void);
+        int cx = __atomic_load_n(&present_crop[0], __ATOMIC_RELAXED), cy = __atomic_load_n(&present_crop[1], __ATOMIC_RELAXED);
+        int cw = __atomic_load_n(&present_crop[2], __ATOMIC_RELAXED), ch = __atomic_load_n(&present_crop[3], __ATOMIC_RELAXED);
+        int all_window = R.n_color > 0;
+        for (int i = 0; i < R.n_color; i++) all_window &= R.color[i] && R.color[i]->presented && R.color_level[i] == 0;
+        if (all_window && !cx && !cy && cw > 0 && ch > 0 && ((uint32_t)cw < R.rt_w || (uint32_t)ch < R.rt_h) && som_handheld_profile() &&
+            !(vkr_flags() & 0x1000000)) { /* vkr_flags 0x1000000: full-size window passes, for comparing */
+            if ((uint32_t)cw < R.rt_w) R.rt_w = (uint32_t)cw;
+            if ((uint32_t)ch < R.rt_h) R.rt_h = (uint32_t)ch;
+        }
     }
     PS.n_pass++;
     if (R.dbg) {
@@ -1690,6 +1811,8 @@ static VkPipeline pipe_compile(PipeJob *j, uint64_t *took) {
     j->pi.pColorBlendState = &j->cb, j->pi.pDynamicState = &j->dy;
     VkPipeline p = VK_NULL_HANDLE;
     uint64_t t0 = now_ns();
+    /* a driver crash inside the compile (Mali-G68: SPIR2LIR::on_AccessChain) is only attributable if this line was logged */
+    if (vkr_flags() & 0x400000) som_log("vkr: compiling pipeline vs %s fs %s", j->vk, j->fk);
     VkResult r = vkCreateGraphicsPipelines(g_vkr.dev, g_pcache, 1, &j->pi, NULL, &p);
     uint64_t dt = now_ns() - t0;
     *took = dt;
@@ -2029,14 +2152,47 @@ static void img_load(Img *i) {
             uint32_t w = mip(i->w, level), h = mip(i->h, level), dep = i->depth > 1 ? mip(i->depth, level) : 1;
             uint32_t row = (w + (uint32_t)bw - 1) / (uint32_t)bw * (uint32_t)bpb, rows = (h + (uint32_t)bh - 1) / (uint32_t)bh;
             uint64_t sz = (uint64_t)row * rows * dep, off;
-            uint8_t *dst = ring_alloc(sz, 16, &off);
-            if (!dst || nr >= 256) {
+            /* a BC texture decoded on the CPU (i->bc): the ring gets the decoded texels, the blocks go to a scratch buffer */
+            uint64_t up = i->bc ? (uint64_t)w * h * dep * bc_fallback_bpp(i->bc) : sz;
+            static uint8_t *bc_tmp;
+            static uint64_t bc_cap;
+            if (i->bc && sz > bc_cap) {
+                free(bc_tmp);
+                bc_cap = sz;
+                bc_tmp = malloc(bc_cap);
+                if (!bc_tmp) bc_cap = 0;
+            }
+            uint8_t *dst = ring_alloc(up, 16, &off);
+            if (!dst || nr >= 256 || (i->bc && !bc_tmp)) {
                 som_log("vkr: upload ring full for texture serial %llu (%u regions): uploaded again at its next use", (unsigned long long)t->serial, nr);
                 i->loaded = 0; /* the next submit starts with an empty ring */
                 goto done;
             }
-            if (nvn_deswizzle(d, level, layer, t->mem, dst, row)) memset(dst, 0, sz);
-            PS.b_tex += sz;
+            if (!i->bc) {
+                if (nvn_deswizzle(d, level + i->drop, layer, t->mem, dst, row)) memset(dst, 0, sz);
+            } else if (nvn_deswizzle(d, level + i->drop, layer, t->mem, bc_tmp, row)) {
+                memset(dst, 0, up);
+            } else {
+                bc_decode_level(i->bc, bc_tmp, row, w, h, dep, dst);
+                /* <data>/bc_dump: write the first decoded level 0 of up to 6 textures per BC format to <data>/bcdump/ for
+                 * inspection on the PC (raw texels of the decoded format) */
+                static int dump_on = -1, dumped[256];
+                if (dump_on < 0) {
+                    char p[600];
+                    snprintf(p, sizeof p, "%s/bc_dump", som_data_dir());
+                    dump_on = access(p, F_OK) == 0;
+                    if (dump_on) snprintf(p, sizeof p, "%s/bcdump", som_data_dir()), mkdir(p, 0755);
+                }
+                if (dump_on && level == 0 && layer == 0 && w >= 64 && dumped[i->bc & 255] < 6) {
+                    dumped[i->bc & 255]++;
+                    char p[700];
+                    snprintf(p, sizeof p, "%s/bcdump/%llu_vk%d_to%d_%ux%u.raw", som_data_dir(), (unsigned long long)t->serial, (int)i->bc,
+                             (int)i->fmt, w, h);
+                    FILE *fp = fopen(p, "wb");
+                    if (fp) fwrite(dst, 1, (size_t)up, fp), fclose(fp);
+                }
+            }
+            PS.b_tex += up;
             regs[nr++] = (VkBufferImageCopy){off, 0, 0, {i->aspect, level, layer, 1}, {0, 0, 0}, {w, h, dep}};
         }
 done:
@@ -2564,6 +2720,12 @@ static void do_draw_inner(int prim, int indexed, int count, int first, int base_
         skip(__LINE__);
         return;
     }
+    /* experiment: -3 skips the draws of passes into a presented (window) image */
+    if (g_skip_pass != -1 && (g_skip_pass == -2 || (pass_no >= g_skip_pass && pass_no <= g_skip_hi) ||
+                              (g_skip_pass == -3 && R.n_color && R.color[0] && R.color[0]->presented))) {
+        gp_first_draw(fs->key);
+        return;
+    }
     vkCmdBindPipeline(R.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     gp_first_draw(fs->key);
     set_dynamic();
@@ -2719,6 +2881,11 @@ static void do_copy_b2t(const p_copy_b2t *c) {
     /* array layers and cube faces are Vulkan layers (z of the region); only a 3D texture has depth. Cube maps were
      * treated like 3D: every face went to face 0 at a z offset, an invalid copy that left five faces undefined. */
     int array = c->tex->d.target != NVN_TEXTURE_TARGET_3D && i->depth == 1 && i->layers > 1;
+    if (i->drop) { /* a reduced texture (Texture size) written by a copy: should not happen */
+        static int warned;
+        if (warned++ < 8) som_log("vkr: texture size: buffer-to-texture copy into reduced serial %llu: skipped", (unsigned long long)c->tex->serial);
+        return;
+    }
     uint32_t level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     if (level >= i->levels || (array ? (uint32_t)r->zoffset + layer + dep : layer + 1) > i->layers) {
         static int warned;
@@ -2744,6 +2911,11 @@ static void do_copy_t2t(const p_copy_t2t *c) {
     end_pass();
     Img *s = c->src ? img_get(c->src) : NULL, *d = c->dst ? img_get(c->dst) : NULL;
     if (!s || !d || s == d) return;
+    if (s->drop || d->drop) { /* a reduced texture (Texture size) in a texture copy: should not happen */
+        static int warned;
+        if (warned++ < 8) som_log("vkr: texture size: texture copy with reduced serial %llu: skipped", (unsigned long long)(s->drop ? s->serial : d->serial));
+        return;
+    }
     img_init(s);
     img_load(s);
     img_init(d);
@@ -2855,6 +3027,16 @@ void vkr_submit_begin(void) {
         FR[fr_cur].pending = 0;
         gp_collect();
     }
+    {
+        /* ADPF: the frame that just ended (from the previous submit's start to this one), its CPU part (without the
+         * fence wait it began with) and the GPU time of the latest finished submit */
+        static uint64_t prev_begin, prev_wait;
+        if (prev_begin && perf_hint_active()) {
+            int64_t total = (int64_t)(pf_begin - prev_begin);
+            perf_hint_frame((int64_t)prev_begin, total, total - (int64_t)prev_wait, gp_last_gpu_ns);
+        }
+        prev_begin = pf_begin, prev_wait = PS.t[PF_WAIT];
+    }
     R.cb = FR[fr_cur].cb, R.fence = FR[fr_cur].fence, R.dpool = FR[fr_cur].dpool;
     ring_buf = FR[fr_cur].ring_buf, ring_mem = FR[fr_cur].ring_mem, ring_ptr = FR[fr_cur].ring_ptr;
     vkResetDescriptorPool(g_vkr.dev, R.dpool, 0);
@@ -2909,9 +3091,15 @@ static void pf_end(uint64_t now, uint64_t nsub) {
 }
 
 volatile uint64_t g_vkr_last_submit_ns; /* stall detection (nvn_glue.c watchdog) */
+/* the steps of vkr_submit_end, per submit (logged every 5 s): end_pass, vkEndCommandBuffer, waiting for the queue lock
+ * (shared with the window thread's present), vkQueueSubmit */
+static uint64_t se_t[4], se_n;
+
 void vkr_submit_end(void) {
     if (!R.active) return;
+    uint64_t se0 = now_ns();
     end_pass();
+    se_t[0] += now_ns() - se0;
     static int ne;
     if (ne++ < 12) som_log("vkr: end #%d (submitting)", ne);
     cap_copy();
@@ -2933,14 +3121,27 @@ void vkr_submit_end(void) {
         }
     }
     gp_submit_end();
+    uint64_t se1 = now_ns();
     VK_CHECK(vkEndCommandBuffer(R.cb));
     R.recording = 0;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &R.cb;
+    uint64_t se2 = now_ns();
     pthread_mutex_lock(&g_vkr.qmu);
+    uint64_t se3 = now_ns();
     VkResult r = vkQueueSubmit(g_vkr.queue, 1, &si, R.fence);
     pthread_mutex_unlock(&g_vkr.qmu);
+    {
+        uint64_t se4 = now_ns();
+        se_t[1] += se2 - se1, se_t[2] += se3 - se2, se_t[3] += se4 - se3, se_n++;
+        static uint64_t se_log;
+        if (se4 - se_log >= 5000000000ull && se_n) {
+            som_log("vkr: submit end per submit: end pass %.2f ms, end command buffer %.2f ms, queue lock wait %.2f ms, vkQueueSubmit %.2f ms",
+                    se_t[0] / 1e6 / se_n, se_t[1] / 1e6 / se_n, se_t[2] / 1e6 / se_n, se_t[3] / 1e6 / se_n);
+            memset(se_t, 0, sizeof se_t), se_n = 0, se_log = se4;
+        }
+    }
     if (ne <= 12) som_log("vkr: submitted -> %d", (int)r);
     /* Not waited for (see FR) unless something reads the results back right away: a frame capture, the start-up
      * readback, the debug flush; vkr_flags 131072 waits always (the old behaviour, to compare). */
@@ -2976,7 +3177,10 @@ void vkr_submit_end(void) {
         g_vkr_last_submit_ns = now;
         if (now - last_status_ns >= 5000000000ull) {
             last_status_ns = now;
-            som_log("vkr: status submits %llu draws %llu; images live %llu (%llu MB) freed %llu", (unsigned long long)nsub + 1, (unsigned long long)tot_draws, (unsigned long long)g_img_live, (unsigned long long)(g_img_bytes >> 20), (unsigned long long)g_img_freed);
+            som_log("vkr: status submits %llu draws %llu; images live %llu (%llu MB) freed %llu; upload ring peak %.1f MB of %u, %llu refused",
+                    (unsigned long long)nsub + 1, (unsigned long long)tot_draws, (unsigned long long)g_img_live, (unsigned long long)(g_img_bytes >> 20),
+                    (unsigned long long)g_img_freed, ring_peak / 1048576.0, RING_BYTES >> 20, (unsigned long long)ring_full);
+            ring_peak = ring_full = 0;
         }
     }
     if (++nsub <= 3 || nsub % 200 == 0)
@@ -3164,7 +3368,14 @@ int vkr_frame_times(float *out, int max) {
     return cnt;
 }
 
-void vkr_present(const tex_t *t) {
+static int present_crop[4]; /* written before present_serial_now (release), read after it (acquire) */
+
+void vkr_present(const tex_t *t, const int crop[4]) {
+    for (int k = 0; k < 4; k++) __atomic_store_n(&present_crop[k], crop ? crop[k] : 0, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&img_mu);
+    for (Img *i = img_tab[t->serial & 4095]; i; i = i->next)
+        if (i->serial == t->serial) i->presented = 1;
+    pthread_mutex_unlock(&img_mu);
     __atomic_store_n(&present_serial_now, t->serial, __ATOMIC_RELEASE);
     __atomic_store_n(&present_tex, t, __ATOMIC_RELEASE);
     present_serial++;
@@ -3177,14 +3388,34 @@ void vkr_present(const tex_t *t) {
         __atomic_fetch_add(&PW.presents, 1, __ATOMIC_RELAXED);
         if (gap > __atomic_load_n(&PW.max_gap, __ATOMIC_RELAXED)) __atomic_store_n(&PW.max_gap, gap, __ATOMIC_RELAXED);
         {
+            /* a frame well over the target period: log what the guest was doing. The threshold is 1.5 periods (25 ms at
+             * 60 fps, 50 ms at 30) and at most 4 reports a second: on a slow device (the Galaxy A17) a fixed 24 ms flagged
+             * nearly every frame, and formatting/writing 3-5 log lines per frame cost ~4% of the replay thread. */
             extern void som_stall_mark(const char *label);
-            char lb[64];
-            snprintf(lb, sizeof lb, "long frame %.0f ms", (double)gap / 1e6);
-            som_stall_mark(gap > 24000000ull ? lb : NULL); /* a missed vsync (33 ms frame): log what the guest was doing */
+            extern int som_target_fps(void);
+            int fps = som_target_fps();
+            uint64_t limit = fps > 0 ? 1500000000ull / (uint64_t)fps : 24000000ull;
+            static uint64_t win_start;
+            static unsigned win_n;
+            if (now - win_start > 1000000000ull) win_start = now, win_n = 0;
+            if (gap > limit && win_n < 4) {
+                char lb[64];
+                snprintf(lb, sizeof lb, "long frame %.0f ms", (double)gap / 1e6);
+                win_n++;
+                som_stall_mark(lb);
+            } else {
+                som_stall_mark(NULL);
+            }
         }
         if (gap > 50000000ull) __atomic_fetch_add(&PW.over50, 1, __ATOMIC_RELAXED);
         if (gap > 100000000ull) __atomic_fetch_add(&PW.over100, 1, __ATOMIC_RELAXED);
     }
+}
+
+/* the part of the screen the picture was last shown in, as fractions (x, y, w, h): the whole screen unless letterboxed */
+static volatile float present_rect[4] = {0, 0, 1, 1}; /* written by the window thread, read by the event loop: a torn rectangle only misplaces one touch */
+void vkr_present_rect(float r[4]) {
+    for (int k = 0; k < 4; k++) r[k] = present_rect[k];
 }
 
 int vkr_blit_present(VkCommandBuffer cb, VkImage dst, VkExtent2D ext) {
@@ -3196,10 +3427,53 @@ int vkr_blit_present(VkCommandBuffer cb, VkImage dst, VkExtent2D ext) {
         if (k->serial == ps) i = k;
     pthread_mutex_unlock(&img_mu);
     if (!i || !i->inited || i->is_depth) return 0;
-    VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)i->w, (int32_t)i->h, 1}},
-                     {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)ext.width, (int32_t)ext.height, 1}}};
+    /* the window's crop: the handheld profile's 1280x720 picture sits in the top-left of a 1920x1080 texture. Applied on
+     * the handheld profile only; docked (the Adreno devices) the whole texture is shown exactly as before, and a docked
+     * crop smaller than the texture is only logged. */
+    extern int som_handheld_profile(void);
+    int32_t x0 = 0, y0 = 0, x1 = (int32_t)i->w, y1 = (int32_t)i->h;
+    int cx = __atomic_load_n(&present_crop[0], __ATOMIC_RELAXED), cy = __atomic_load_n(&present_crop[1], __ATOMIC_RELAXED);
+    int cw = __atomic_load_n(&present_crop[2], __ATOMIC_RELAXED), ch = __atomic_load_n(&present_crop[3], __ATOMIC_RELAXED);
+    int valid = cw > 0 && ch > 0 && cx >= 0 && cy >= 0 && (uint32_t)(cx + cw) <= i->w && (uint32_t)(cy + ch) <= i->h;
+    int partial = valid && (cx || cy || (uint32_t)cw != i->w || (uint32_t)ch != i->h);
+    if (partial && som_handheld_profile()) {
+        x0 = cx, y0 = cy, x1 = cx + cw, y1 = cy + ch;
+    } else if (partial) {
+        static int logged;
+        if (!logged++) som_log("vkr: docked window crop %d,%d %dx%d of %ux%u (not applied: whole image shown)", cx, cy, cw, ch, i->w, i->h);
+    }
+    {
+        static int last[4];
+        if (last[0] != cx || last[1] != cy || last[2] != cw || last[3] != ch) {
+            last[0] = cx, last[1] = cy, last[2] = cw, last[3] = ch;
+            som_log("vkr: window crop %d,%d %dx%d of %ux%u -> shown %dx%d", cx, cy, cw, ch, i->w, i->h, x1 - x0, y1 - y0);
+        }
+    }
+    /* where on the screen: all of it (Stretch to fill), or the largest centred rectangle of the picture's own shape
+     * (Aspect ratio 16:9; the rest stays the clear colour, black: main.c) */
+    extern int som_keep_aspect(void);
+    int32_t dx0 = 0, dy0 = 0, dx1 = (int32_t)ext.width, dy1 = (int32_t)ext.height;
+    if (som_keep_aspect()) {
+        uint64_t pw = (uint64_t)(x1 - x0), ph = (uint64_t)(y1 - y0);
+        if (pw * ext.height > ph * ext.width) { /* wider than the screen: bars above and below */
+            int32_t h = (int32_t)(ext.width * ph / pw);
+            dy0 = ((int32_t)ext.height - h) / 2, dy1 = dy0 + h;
+        } else { /* narrower: bars left and right */
+            int32_t w = (int32_t)(ext.height * pw / ph);
+            dx0 = ((int32_t)ext.width - w) / 2, dx1 = dx0 + w;
+        }
+    }
+    present_rect[0] = (float)dx0 / (float)ext.width;
+    present_rect[1] = (float)dy0 / (float)ext.height;
+    present_rect[2] = (float)(dx1 - dx0) / (float)ext.width;
+    present_rect[3] = (float)(dy1 - dy0) / (float)ext.height;
+    VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{x0, y0, 0}, {x1, y1, 1}},
+                     {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx0, dy0, 0}, {dx1, dy1, 1}}};
+    /* nearest at 1:1 (the Adreno handhelds' 1920x1080 panels: unchanged); linear when the picture is scaled */
+    int scaled = x1 - x0 != dx1 - dx0 || y1 - y0 != dy1 - dy0;
+    VkFilter filt = scaled && i->linear_ok ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    vkCmdBlitImage(cb, i->image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    vkCmdBlitImage(cb, i->image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, filt);
     return 1;
 }

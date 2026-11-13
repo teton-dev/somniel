@@ -221,6 +221,7 @@ void sync_signal_cv(uint64_t key, int32_t count) {
 }
 
 /* diagnostics: every queued waiter with the current value of its key / mutex word */
+void kthread_debug_dump(void);
 void sync_debug_dump(void) {
     pthread_mutex_lock(&g_mu);
     for (Waiter *w = g_cv_q; w; w = w->next)
@@ -230,6 +231,7 @@ void sync_debug_dump(void) {
         som_log("stall: lock waiter addr 0x%llx tag 0x%x done %d word 0x%x", (unsigned long long)w->key, w->tag, w->done,
                 load32(w->key));
     pthread_mutex_unlock(&g_mu);
+    kthread_debug_dump();
 }
 
 /* ---- address arbiter ---- */

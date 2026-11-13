@@ -19,7 +19,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## Other bundled code
 
-- `third_party/SDL` (submodule, zlib licence), `third_party/volk` (MIT) and `third_party/libadrenotools` (BSD-style)
-  keep their own licence files in their folders.
+- `third_party/SDL` (submodule, zlib licence), `third_party/volk` (MIT), `third_party/libadrenotools` (BSD-style) and
+  `third_party/bcdec` (MIT, BC texture decoding for GPUs without BC support) keep their own licence files in their
+  folders.
 - The NVN front end follows notes from the engage-pc-recomp project (MIT), credited in the source headers.
 - Cobalt (Raytwo) is not part of Somniel: users download it separately.

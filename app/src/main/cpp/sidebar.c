@@ -25,6 +25,19 @@ JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSetRenderSca
     som_set_render_scale(pct);
 }
 
+void som_set_graphics(int key, int value); /* game_patches.c: 0 shadows, 1 model detail, 2 texture sharpness, 3 shader precision, 4 console mode, 5 texture size, 6 anti-aliasing, 7 aspect ratio */
+
+JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSetGraphics(JNIEnv *env, jclass cls, jint key, jint value) {
+    som_set_graphics(key, value);
+}
+
+int som_handheld_profile(void); /* hooks_system.c */
+
+/* The frame rate the sidebar starts with until the user picks one: 30 on the handheld profile (Mali GPUs), else 60. */
+JNIEXPORT jint JNICALL Java_dev_teton_somniel_SomnielActivity_nativeDefaultFrameRate(JNIEnv *env, jclass cls) {
+    return som_handheld_profile() ? 30 : 60;
+}
+
 extern uint64_t som_gfx_presents;
 
 /* True once the game has presented a frame: the Java splash overlay goes away then. */

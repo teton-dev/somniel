@@ -28,6 +28,8 @@ void som_log_init(const char *dir) {
         g_log = fopen(path, "w");
         snprintf(path, sizeof path, "%s/svc_trace.on", dir);
         som_trace_on = access(path, F_OK) == 0;
+        snprintf(path, sizeof path, "%s/nvn_timing", dir);
+        som_nvn_timing_on = access(path, F_OK) == 0;
         snprintf(g_trace_path, sizeof g_trace_path, "%s/svc_trace.log", dir);
         g_trace = fopen(g_trace_path, "w");
         if (g_trace) setvbuf(g_trace, NULL, _IOFBF, 1 << 20);
@@ -59,6 +61,7 @@ void som_log(const char *fmt, ...) {
 __thread int som_trace_quiet; /* svc.c sets it while a thread repeats the same call (polling loops) */
 
 int som_trace_on;
+int som_nvn_timing_on;
 
 void som_trace_(const char *fmt, ...) {
     if (som_trace_quiet) return;

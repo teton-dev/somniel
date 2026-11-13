@@ -2,9 +2,11 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 _Static_assert(offsetof(GuestCtx, x) == CTX_X, "CTX_X");
 _Static_assert(offsetof(GuestCtx, sp) == CTX_SP, "CTX_SP");
@@ -19,6 +21,60 @@ _Static_assert(offsetof(GuestCtx, dispatch) == CTX_DISPATCH, "CTX_DISPATCH");
 _Static_assert(offsetof(GuestCtx, callee) == CTX_CALLEE, "CTX_CALLEE");
 _Static_assert(offsetof(GuestCtx, q) == CTX_Q, "CTX_Q");
 _Static_assert(offsetof(GuestCtx, call_sp) == CTX_CALL_SP, "CTX_CALL_SP");
+
+extern void som_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+extern const char *som_data_dir(void);
+
+/* Horizon layout by default; see guest.h. NRO modules (Cobalt) are placed 0x38000000 above the base on that layout. */
+uint64_t g_as_base = 0x08000000ull;
+uint64_t g_aslr_size = ALIAS_BASE - 0x08000000ull;
+uint64_t g_nro_first_base = 0x40000000ull;
+
+void guest_layout_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    /* stub island A (0x6000000), the modules (~127 MiB from 0x8000000) and island B, with room for a Cobalt subsdk9 */
+    const uint64_t lo = 0x06000000ull, hi = 0x11800000ull;
+    void *p = mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+    if (p != MAP_FAILED) munmap(p, hi - lo); /* free (p == lo), or an old kernel that treated the address as a hint */
+    /* the low range is free on the Adreno devices and was taken on the Galaxy A17 (one launch seen), so each device only
+     * exercises one path: <data>/guest_window_high forces the 4 GiB window for testing it anywhere */
+    char flag[600];
+    snprintf(flag, sizeof flag, "%s/guest_window_high", som_data_dir());
+    int forced = access(flag, F_OK) == 0;
+    if (p == (void *)lo && !forced) {
+        som_log("guest layout: Horizon window at 0x%llx", (unsigned long long)g_as_base);
+        return;
+    }
+    g_as_base = 0x100000000ull;
+    g_aslr_size = ALIAS_BASE - g_as_base;
+    g_nro_first_base = g_as_base + 0x40000000ull;
+    som_log("guest layout: 0x%llx-0x%llx is %s: window moved to 0x%llx", (unsigned long long)lo, (unsigned long long)hi,
+            forced ? "forced off by guest_window_high" : "taken on this device (ART heap)", (unsigned long long)g_as_base);
+}
+
+uint64_t g_tick_hi = 1, g_tick_frac = 0;
+
+void som_tick_init(void) {
+    uint64_t freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    const uint64_t guest = 19200000;
+    if (!freq || freq == guest) {
+        som_log("ticks: host counter %llu Hz: guest ticks are the host's (the Switch's 19.2 MHz)", (unsigned long long)freq);
+        return;
+    }
+    g_tick_hi = guest / freq;
+    g_tick_frac = (uint64_t)(((unsigned __int128)(guest % freq) << 64) / freq);
+    som_log("ticks: host counter %llu Hz: guest ticks scaled to 19.2 MHz (x %.6f)", (unsigned long long)freq,
+            (double)guest / (double)freq);
+}
+
+uint64_t som_guest_tick(void) {
+    uint64_t v;
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+    return v * g_tick_hi + (uint64_t)(((unsigned __int128)v * g_tick_frac) >> 64);
+}
 
 #define MAX_CTX 512
 uint64_t som_ctx_pool_lo, som_ctx_pool_hi;

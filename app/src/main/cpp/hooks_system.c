@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/system_properties.h>
 
 #include "debug_log.h"
 #include "hook.h"
@@ -18,11 +19,7 @@ uint32_t bind_system_event(GuestCtx *c, uint64_t ev, int autoclear);
 
 #define ACCOUNT_R_INVALID 0x7c67u
 
-static uint64_t ticks(void) {
-    uint64_t v;
-    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
-    return v;
-}
+static uint64_t ticks(void) { return som_guest_tick(); } /* 19.2 MHz, as the TimeSpan conversion below assumes */
 
 /* ---- nn::oe ---- */
 
@@ -45,7 +42,48 @@ static void oe_performance_config(GuestCtx *c) {
 }
 static void oe_noop(GuestCtx *c) { (void)c; }
 static void oe_ret_zero(GuestCtx *c) { ret_x(c, 0); }
-static void oe_docked(GuestCtx *c) { ret_x(c, 1); } /* OperationMode::Console / PerformanceMode::Boost */
+/* Device profile: what the game is told about the console's mode. Docked (OperationMode::Console, PerformanceMode::Boost:
+ * the game renders for 1080p) everywhere so far; the Switch's handheld profile (OperationMode::Handheld,
+ * PerformanceMode::Normal: the game's own handheld resolution, which the render-scale slider then multiplies) on Mali GPUs,
+ * which also default to 30 fps (game_patches.c, the sidebar). The game only reads these two calls, no display resolution.
+ * The sidebar's Console mode (Graphics page: Auto / Handheld / Docked, game_patches.c) overrides the GPU default;
+ * <data>/profile_docked or <data>/profile_handheld (debugging) override both. Latched at the first call, so a change
+ * applies at the next launch: the sidebar sends its choice before it asks for the default frame rate. */
+extern int som_profile_choice(void);
+/* the device's GPU is a Mali (its Vulkan or EGL driver names it): Console mode Auto's default */
+int som_gpu_is_mali(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int mali = 0;
+    char v[PROP_VALUE_MAX];
+    if (__system_property_get("ro.hardware.vulkan", v) > 0 && strstr(v, "mali")) mali = 1;
+    if (!mali && __system_property_get("ro.hardware.egl", v) > 0 && strstr(v, "mali")) mali = 1;
+    return cached = mali;
+}
+int som_handheld_profile(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int mali = som_gpu_is_mali();
+    int handheld = mali;
+    const char *why = mali ? "Mali GPU" : "default";
+    int choice = som_profile_choice();
+    if (choice == 1) handheld = 1, why = "Console mode setting";
+    if (choice == 2) handheld = 0, why = "Console mode setting";
+    const char *dir = som_data_dir();
+    if (dir && dir[0]) {
+        char p[600];
+        snprintf(p, sizeof p, "%s/profile_docked", dir);
+        if (access(p, F_OK) == 0) handheld = 0, why = "profile_docked";
+        snprintf(p, sizeof p, "%s/profile_handheld", dir);
+        if (access(p, F_OK) == 0) handheld = 1, why = "profile_handheld";
+        cached = handheld; /* only cached once the data dir (and so the override files) can be read */
+    }
+    som_log("profile: %s (%s)", handheld ? "handheld (Switch handheld resolution, 30 fps default)" : "docked", why);
+    return handheld;
+}
+
+static void oe_operation_mode(GuestCtx *c) { ret_x(c, som_handheld_profile() ? 0 : 1); }   /* Handheld 0 / Console 1 */
+static void oe_performance_mode(GuestCtx *c) { ret_x(c, som_handheld_profile() ? 0 : 1); } /* Normal 0 / Boost 1 */
 static void oe_in_focus(GuestCtx *c) { ret_x(c, 1); }
 
 /* void GetDisplayVersion(DisplayVersion *out): the 16-byte string of the application's version (Cobalt checks it,
@@ -333,8 +371,8 @@ void hooks_system_register(void) {
     hook_register("_ZN2nn2oe18GetDesiredLanguageEv", oe_desired_language);
     hook_register("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", oe_performance_config);
     hook_register("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", oe_noop);
-    hook_register("_ZN2nn2oe16GetOperationModeEv", oe_docked);
-    hook_register("_ZN2nn2oe18GetPerformanceModeEv", oe_docked);
+    hook_register("_ZN2nn2oe16GetOperationModeEv", oe_operation_mode);
+    hook_register("_ZN2nn2oe18GetPerformanceModeEv", oe_performance_mode);
     hook_register("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", oe_focus_mode);
     hook_register("_ZN2nn2oe20GetCurrentFocusStateEv", oe_in_focus);
     hook_register("_ZN2nn2oe28SetResumeNotificationEnabledEb", oe_noop);

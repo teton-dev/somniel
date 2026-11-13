@@ -45,11 +45,8 @@ void nvn_lock_leave(void);
 int kern_core_away(void);
 void kern_core_back(int *away);
 uint64_t kern_now_ns(void);
-static inline uint64_t rt_ticks(void) {
-    uint64_t v;
-    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
-    return v;
-}
+uint64_t som_guest_tick(void); /* guest.c: the host counter in the Switch's 19.2 MHz ticks */
+static inline uint64_t rt_ticks(void) { return som_guest_tick(); }
 
 /* host -> guest call (guest_call.c): up to 8 integer arguments, returns x0 */
 uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...);

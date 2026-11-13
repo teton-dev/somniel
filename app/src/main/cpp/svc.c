@@ -660,7 +660,7 @@ static void svc_exec(GuestCtx *c) {
         if (som_trace_on && ((int64_t)x[3] < 0 || x[3] > 0xFFFFFFFFFull)) log_backtrace(c, "waits (cond var)");
         x[0] = sync_wait_cv(x[0], x[1], (uint32_t)x[2], timeout_arg(x[3])); return;
     case 0x1D: sync_signal_cv(x[0], (int32_t)x[1]); x[0] = 0; return;
-    case 0x1E: x[0] = cntvct(); return; /* GetSystemTick */
+    case 0x1E: x[0] = som_guest_tick(); return; /* GetSystemTick: 19.2 MHz ticks (guest.h) */
     case 0x24: x[0] = 0; x[1] = 0x51; return; /* GetProcessId */
     case 0x25: { /* GetThreadId(handle) */
         KThread *t = (uint32_t)x[1] == HANDLE_CUR_THREAD ? kthread_current() : kobj_get((uint32_t)x[1], KO_THREAD);

@@ -35,7 +35,34 @@ extern void som_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 extern const char *som_data_dir(void);
 extern const char *som_game_dir(void); /* services_fs.c: where exefs/ and romfs.bin are */
 
-#define HOST_ANSWERS "sf64 sb64 sg64" /* softfloat64, storage buffer alignment 64, subgroup 64 (Adreno 740) */
+/* Host answers for the translator: softfloat64, storage buffer alignment, subgroup size, clip distances. The cache header
+ * records them, so another GPU starts a fresh cache; on the Adreno 740 the header stays "sf64 sb64 sg64" as before.
+ * - sbuf_align is NOT a device property here: vkr.c binds each storage buffer from its address rounded down to 64
+ *   (b->addr & 63), and the shaders must count offsets from the same place. It stays 64 (both GPUs' minimum divides it).
+ * - subgroup comes from the device (Adreno 740: 64, Mali Valhall: 16).
+ * - a device without shaderClipDistance (Mali-G68) gets "clip_distance": false and " nc" in the header.
+ * - Shader precision (sidebar, game_patches.c): Fast sends "reduced": true and adds " rp"; Fastest also sends
+ *   "half": true and adds " hp". Each mode has its own file (shaders-fast.cache, shaders-half.cache), so switching
+ *   back and forth keeps every cache. */
+extern int som_shader_precision(void);
+static unsigned hs_sbuf_align = 64, hs_subgroup = 64;
+static int hs_no_clip, hs_reduced, hs_half;
+static int hs_half_mask = -1; /* <data>/half_mask (debugging Fastest): which op classes go fp16 (translator HalfClass); -1 all */
+static void cache_path(char *path, size_t n) {
+    if (hs_half && hs_half_mask != -1) { /* a debug mask gets its own file: the 48-byte header id has no room for it */
+        snprintf(path, n, "%s/shaders-half-m%x.cache", som_data_dir(), (unsigned)hs_half_mask);
+        return;
+    }
+    snprintf(path, n, "%s/%s", som_data_dir(), hs_half ? "shaders-half.cache" : hs_reduced ? "shaders-fast.cache" : "shaders.cache");
+}
+static void host_answers_init(void) {
+    /* the Vulkan device may still be coming up: wait a little, then fall back to the Adreno values */
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_vkr.ready, __ATOMIC_ACQUIRE); i++) usleep(10000);
+    if (__atomic_load_n(&g_vkr.ready, __ATOMIC_ACQUIRE)) {
+        if (g_vkr.subgroup_size) hs_subgroup = g_vkr.subgroup_size;
+        hs_no_clip = !g_vkr.clip_distance;
+    }
+}
 #define REC_MAGIC 0x45524353u         /* "SCRE" */
 #define HDR_SIZE 64
 #define REC_HDR 20
@@ -167,7 +194,7 @@ static int pwrite_all(const void *b, size_t n, uint64_t off) {
 
 static void open_cache(const char *id) {
     char path[600];
-    snprintf(path, sizeof path, "%s/shaders.cache", som_data_dir());
+    cache_path(path, sizeof path);
     sc.fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (sc.fd < 0) {
         som_log("shader cache: cannot open %s: %s", path, strerror(errno));
@@ -217,6 +244,18 @@ static void open_cache(const char *id) {
 }
 
 static void sc_init(void) {
+    int prec = som_shader_precision(); /* set from the sidebar prefs before the game starts */
+    hs_reduced = prec >= 1, hs_half = prec == 2;
+    if (hs_half) {
+        char mp[600];
+        snprintf(mp, sizeof mp, "%s/half_mask", som_data_dir());
+        FILE *mf = fopen(mp, "r");
+        if (mf) {
+            if (fscanf(mf, "%i", &hs_half_mask) != 1) hs_half_mask = -1;
+            fclose(mf);
+            som_log("shader cache: half_mask %#x", (unsigned)hs_half_mask);
+        }
+    }
     void *h = dlopen("libxlate.so", RTLD_NOW | RTLD_LOCAL);
     if (h) {
         sc.translate = (xl_translate_fn)dlsym(h, "xlate_translate");
@@ -247,13 +286,15 @@ static void sc_init(void) {
         clock_gettime(CLOCK_MONOTONIC, &t0);
         if (sc.translate) on_xlate_thread(get_version, &v);
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        snprintf(id, sizeof id, "%s %s", v, HOST_ANSWERS);
+        host_answers_init();
+        snprintf(id, sizeof id, "%s sf64 sb%u sg%u%s%s%s", v, hs_sbuf_align, hs_subgroup, hs_no_clip ? " nc" : "", hs_reduced ? " rp" : "",
+                 hs_half ? " hp" : "");
         som_log("shader cache: translator %s started in %.1f ms", v, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
     }
     if (!sc.translate) {
         /* read-only: accept whatever header is there */
         char path[600];
-        snprintf(path, sizeof path, "%s/shaders.cache", som_data_dir());
+        cache_path(path, sizeof path);
         int fd = open(path, O_RDONLY | O_CLOEXEC);
         char hdr[HDR_SIZE] = {0};
         if (fd >= 0 && read(fd, hdr, HDR_SIZE) == HDR_SIZE) snprintf(id, sizeof id, "%.47s", hdr + 16);
@@ -316,7 +357,11 @@ static int build_job(const char *key, int stage, const uint8_t *ctl, char *job, 
     w += put_tex_map(job + w, n - (size_t)w, "img", img);
     w += put_attr_map(job + w, n - (size_t)w, "attr", attr, 32);
     w += put_attr_map(job + w, n - (size_t)w, "fout", fout, 8);
-    w += snprintf(job + w, n - (size_t)w, ",\"shared\":%u,\"softfloat64\":true,\"sbuf_align\":64,\"subgroup\":64", shared);
+    w += snprintf(job + w, n - (size_t)w, ",\"shared\":%u,\"softfloat64\":true,\"sbuf_align\":%u,\"subgroup\":%u", shared, hs_sbuf_align, hs_subgroup);
+    if (hs_no_clip) w += snprintf(job + w, n - (size_t)w, ",\"clip_distance\":false");
+    if (hs_reduced) w += snprintf(job + w, n - (size_t)w, ",\"reduced\":true");
+    if (hs_half) w += snprintf(job + w, n - (size_t)w, ",\"half\":true");
+    if (hs_half && hs_half_mask != -1) w += snprintf(job + w, n - (size_t)w, ",\"half_mask\":%d", hs_half_mask);
     if (nvn_stage == 1 && (ctl[0x718] & 1)) w += snprintf(job + w, n - (size_t)w, ",\"early_fragment_tests\":true");
     if (nvn_stage == 5) {
         uint32_t l[3];

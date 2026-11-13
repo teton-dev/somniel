@@ -181,6 +181,29 @@ int patch_insert(uint64_t site, const uint32_t *w, unsigned n, Island *isl, int 
     return 1;
 }
 
+/* mrs xN, cntpct_el0 on a host whose counter is not 19.2 MHz (guest.h): a stub reads the virtual counter and scales it,
+ * xN = xN * g_tick_hi + umulh(xN, g_tick_frac), with two scratch registers saved on the guest stack. */
+static int patch_cntpct_scaled(uint64_t site, uint32_t rt, Island *isl, int nisl) {
+    Island *is = pick_island(isl, nisl, site);
+    uint32_t *stub = is ? isl_alloc(is, 12) : NULL;
+    if (!stub) return 0;
+    uint64_t sa = is->addr + (uint64_t)((uint8_t *)stub - is->mem);
+    uint32_t a = rt == 9 ? 11 : 9, b = rt == 10 ? 11 : 10;
+    uint32_t k = 0;
+    stub[k++] = 0xA9BF0000u | (b << 10) | (31u << 5) | a;            /* stp xa, xb, [sp, #-16]! */
+    stub[k++] = 0xD53BE040u | rt;                                    /* mrs xN, cntvct_el0 */
+    stub[k] = 0x58000000u | (((8 - k) & 0x7FFFFu) << 5) | a, k++;    /* ldr xa, frac (word 8) */
+    stub[k++] = 0x9BC07C00u | (a << 16) | (rt << 5) | b;             /* umulh xb, xN, xa */
+    stub[k] = 0x58000000u | (((10 - k) & 0x7FFFFu) << 5) | a, k++;   /* ldr xa, hi (word 10) */
+    stub[k++] = 0x9B000000u | (a << 16) | (b << 10) | (rt << 5) | rt; /* madd xN, xN, xa, xb */
+    stub[k++] = 0xA8C10000u | (b << 10) | (31u << 5) | a;            /* ldp xa, xb, [sp], #16 */
+    stub[k] = enc_b(sa + k * 4, site + 4, 0);                        /* b site + 4 */
+    memcpy(&stub[8], &g_tick_frac, 8);
+    memcpy(&stub[10], &g_tick_hi, 8);
+    *(uint32_t *)site = enc_b(site, sa, 0);
+    return 1;
+}
+
 void patch_text(uint64_t text, size_t size, Island *isl, int nisl, PatchStats *st) {
     uint32_t *code = (uint32_t *)text;
     size_t n = size / 4;
@@ -189,6 +212,11 @@ void patch_text(uint64_t text, size_t size, Island *isl, int nisl, PatchStats *s
         uint64_t site = text + i * 4;
         uint32_t rt = w & 31;
         if ((w & 0xFFFFFFE0u) == 0xD53BE020u) { /* mrs xN, cntpct_el0: EL0 may only read the virtual counter */
+            if ((g_tick_hi != 1 || g_tick_frac) && rt != 31) {
+                if (patch_cntpct_scaled(site, rt, isl, nisl)) st->cntpct++;
+                else st->skipped++, code[i] = 0xD53BE040u | rt; /* no island room: unscaled, as before */
+                continue;
+            }
             code[i] = 0xD53BE040u | rt;
             st->cntpct++;
             continue;

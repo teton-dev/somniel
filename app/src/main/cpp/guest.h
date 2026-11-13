@@ -57,9 +57,25 @@ void guest_region_set(uint64_t base, uint64_t size, uint32_t type, uint32_t perm
 void guest_query(uint64_t addr, MemInfo *out);
 
 /* address-space layout reported to the guest through svc GetInfo */
-#define AS_BASE        0x0000000008000000ull
-#define ASLR_BASE      0x0000000008000000ull
-#define ASLR_SIZE      0x0000000FF8000000ull   /* up to 64 GiB */
+/* The guest window starts at Horizon's 0x8000000 whenever that range is free (always on the Adreno devices, where this
+ * is exactly the layout that has always been used). ART maps its Java heap, large-object space and JIT caches below
+ * 4 GiB at addresses that vary by device (Galaxy A17, Mali-G68, Android 16: 0x2000000-0x12000000), and a module cannot
+ * be mapped over them; guest_layout_init() then moves the window to 4 GiB, where nothing is mapped. It runs once at the
+ * top of spike_start(), before any of the three variables below is read. */
+extern uint64_t g_as_base, g_aslr_size, g_nro_first_base;
+void guest_layout_init(void);
+
+/* Guest system ticks run at the Switch's 19.2 MHz: nn::os::GetSystemTickFrequency is the constant 19200000, while every
+ * tick the SDK reads (mrs cntpct_el0, svc GetSystemTick) came straight from the host counter. Snapdragon counts at
+ * 19.2 MHz too; the Exynos 1330 counts at 26 MHz, so the game's clock ran 1.35x fast there (movies dropped two thirds
+ * of their frames and resynced every second). guest = host * g_tick_hi + (host * g_tick_frac) >> 64, which is exactly
+ * the host value (hi 1, frac 0) where the host already counts at 19.2 MHz. som_tick_init() runs before patching. */
+extern uint64_t g_tick_hi, g_tick_frac;
+void som_tick_init(void);
+uint64_t som_guest_tick(void);
+#define AS_BASE        g_as_base
+#define ASLR_BASE      g_as_base
+#define ASLR_SIZE      g_aslr_size             /* up to 64 GiB: ends at ALIAS_BASE */
 #define ALIAS_BASE     0x0000001000000000ull
 #define ALIAS_SIZE     0x0000001000000000ull
 #define HEAP_BASE      0x0000002000000000ull

@@ -13,14 +13,15 @@
 #include "guest.h"
 #include "hook.h"
 #include "ipc.h"
+#include "movies.h"
 #include "thread.h"
 #include "nvn/shader_cache.h"
 
 extern const char *som_data_dir(void);
 
-#define ISLAND_A   0x06000000ull   /* stub islands: before and after the modules */
+#define ISLAND_A   (MODULE_BASE - 0x02000000ull) /* stub islands: before and after the modules (0x6000000 on the Horizon window) */
 #define ISLAND_SZ  0x01000000ull
-#define MODULE_BASE 0x08000000ull
+#define MODULE_BASE g_as_base /* the guest window (guest.h): 0x8000000, or 4 GiB where ART occupies the low range */
 #define GUEST_STACK_SIZE 0x1000000ull /* 16 MiB main-thread stack */
 #define TLR_SIZE   0x1000ull
 
@@ -54,12 +55,34 @@ static void protect(uint64_t addr, uint64_t size, int prot) {
                 strerror(errno));
 }
 
+/* Cobalt (subsdk9) decides "emulator" when the game's code starts at 0x8004000 or 0x8504000 (an emulator's layout) and
+ * "real console" otherwise. On the console path it starts a TCP log server on port 6969 and sends all of its output
+ * there; that needs real sockets, which Somniel does not provide (nn::socket::Initialize is a stub), so the server
+ * thread aborts and Cobalt's messages vanish. Somniel's default window puts main at 0x8004000, but on devices whose
+ * low range is taken (moto g 2025, sometimes the Galaxy A17: guest.c) main moves to 0x100004000. Then the check's
+ * `cset w0, eq` is made `mov w0, #1`, so Cobalt takes the emulator path everywhere. Matched by its exact instructions
+ * (Cobalt 1.31.0, subsdk9+0x2c0); nothing is changed when they are not found. */
+static void cobalt_emulator_patch(const NsoModule *mods, int nmods) {
+    static const uint32_t sig[7] = {0x52880009, 0x52a00a0a, 0x72a10009, 0xeb09011f, 0xaa0a0129, 0xfa491104, 0x1a9f17e0};
+    if (g_as_base == 0x08000000ull) return; /* main is at 0x8004000: the check already says emulator */
+    for (int i = 0; i < nmods; i++) {
+        if (strcmp(mods[i].name, "subsdk9") != 0) continue;
+        uint32_t *t = (uint32_t *)(uintptr_t)(mods[i].base + mods[i].text_off);
+        size_t n = mods[i].text_size / 4, hits = 0;
+        for (size_t k = 0; k + 7 <= n; k++)
+            if (t[k] == sig[0] && !memcmp(t + k, sig, sizeof sig)) t[k + 6] = 0x52800020u, hits++; /* mov w0, #1 */
+        som_log("spike: Cobalt emulator check %s (%zu found)", hits ? "patched to emulator: high window" : "not found", hits);
+    }
+}
+
 int spike_start(const char *exefs) {
     static const char *const kOrder[] = {"rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3",
                                          "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
                                          "sdk"};
     NsoModule mods[16];
     int nmods = 0;
+    guest_layout_init(); /* first: picks the window that AS_BASE / MODULE_BASE / ISLAND_A name */
+    som_tick_init();     /* before patching: the cntpct sites are scaled where the host counter is not 19.2 MHz */
     uint64_t base = MODULE_BASE;
     char path[512];
 
@@ -72,6 +95,7 @@ int spike_start(const char *exefs) {
         services_set_data_dir(dir);
     }
     sc_prepare_start(); /* shaders: translate the whole game in the background while it boots (shader_cache.c) */
+    movies_init();      /* movies: index them; on a software-VP9 device, convert them to H.264 in the background (movies.c) */
     som_log("spike: loading from %s", exefs);
     for (size_t i = 0; i < sizeof kOrder / sizeof kOrder[0]; i++) {
         uint32_t sz;
@@ -123,6 +147,7 @@ int spike_start(const char *exefs) {
         probes_install(mods, nmods, isl, 2, pp);
     }
     game_patches_apply(mods, nmods, isl, 2);
+    cobalt_emulator_patch(mods, nmods);
     island_seal(&isl[0]);
     island_seal(&isl[1]);
 

@@ -29,9 +29,11 @@ The first boot takes longer than later ones while the game's shaders are prepare
 
 Somniel has only been tested on a Retroid Pocket 6 and AYN Thor, both 8GB and 12GB models, so it's built against the Snapdragon 8 Gen 2 SOC, where it maintains a relatively stable 60FPS. 
 
-- **Mali and Xclipse GPUs are completely untested and are unlikely to work.** The renderer was built and verified
-  against the Adreno 740 driver. On a non-Adreno device the app shows a warning on first boot; you can still try, but
-  expect wrong graphics, bad performance, or the game not starting at all.
+- **Mali GPUs: early support.** The game runs on a Galaxy A17 (Mali-G68) and a moto g 2025 (Mali-G57), but frame
+  rates are low and bugs are likely. On a Mali GPU Somniel starts in the handheld profile at 30 fps, and the sidebar's
+  Graphics page has settings that trade picture quality for speed. The first boot shows a notice about this.
+- **Xclipse GPUs are completely untested.** On other non-Adreno devices the app shows a warning on first boot; you can
+  still try, but expect wrong graphics, bad performance, or the game not starting at all.
 - Other Adreno GPUs and other Snapdragon chips are untested. They may work, and reports are welcome.
 - Requires Vulkan 1.1 and Android 13 or newer is recommended.
 
@@ -47,7 +49,9 @@ Somniel has only been tested on a Retroid Pocket 6 and AYN Thor, both 8GB and 12
 - **Proper sleep and wake.** Lock the screen or switch apps and the game parks itself: guest threads pause, audio
   pauses and the CPU is idle. Unlock and it comes back where you left it.
 - **Built-in 60 fps** (no speed-up). The frame-rate patch is built in and selectable live. See the sidebar below.
-- **Hardware movie decoding.** The opening movie and cutscene video go through Android's hardware VP9 decoder.
+- **Hardware movie decoding.** The opening movie and cutscene video go through Android's hardware VP9 decoder. On
+  devices without one, Somniel converts each movie once in the background to H.264 and plays that on the hardware
+  decoder instead.
 - **On-screen controls** for phones, hidden automatically when a controller is connected. See
   [On-screen controls](#on-screen-controls).
 - **Text entry.** When the game asks for text (your name in New Game, for example) Somniel shows an Android text
@@ -56,6 +60,8 @@ Somniel has only been tested on a Retroid Pocket 6 and AYN Thor, both 8GB and 12
   - **Accurate frame-rate control:** 30, 40 or 60 FPS, applied immediately without restarting.
   - **Render scale:** 50% to 125% of the game's 1728x972 in 5% steps, applied live.
   - **Performance monitor:** FPS, frame times with a graph, CPU/GPU temperatures and clocks.
+  - **Graphics page:** Console mode (Auto / Handheld / Docked), Aspect ratio (Stretch to fill / 16:9), Shadows,
+    Anti-aliasing, Texture sharpness, Texture size and Shader precision.
   - **On-screen controls page:** turn the touch controls on or off, choose which movement controls show, and more.
   - **Mods page:** download or import the Cobalt mod loader, import `.zip` or `.7z` mod archives, switch mod folders
     on and off, restart to apply.

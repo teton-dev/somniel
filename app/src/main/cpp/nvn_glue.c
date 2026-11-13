@@ -281,11 +281,16 @@ void nvn_lock_enter(const char *fn) {
         g_in_fn[id] = fn;
     }
     if (t_nvn_depth++ == 0) {
-        uint64_t a = kern_now_ns();
-        take(fn);
-        t_nt_start = kern_now_ns();
-        t_nt_wait = t_nt_start - a;
-        t_nt_fn = fn;
+        if (__builtin_expect(som_nvn_timing_on, 0)) { /* per-call timing is opt-in: 3 clock reads per NVN call cost ~20% of the submit thread */
+            uint64_t a = kern_now_ns();
+            take(fn);
+            t_nt_start = kern_now_ns();
+            t_nt_wait = t_nt_start - a;
+            t_nt_fn = fn;
+        } else {
+            take(fn);
+            t_nt_fn = NULL;
+        }
     }
 }
 

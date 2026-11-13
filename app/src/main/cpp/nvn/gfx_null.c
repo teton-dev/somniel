@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "gfx.h"
 #include "vkr.h"
@@ -255,6 +256,13 @@ static void ts_draw(void) {
 }
 
 static uint64_t op_hist[64];
+/* replay time per op type, and in vkr_submit_begin / vkr_submit_end (logged every 5 s with the buffer copies) */
+static uint64_t op_ns[64], op_cnt[64], sub_begin_ns, sub_end_ns;
+static inline uint64_t mono_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 /* Skeleton "display": the last colour the game cleared each texture to, shown by main.c for the presented texture. */
 #define CLR_SLOTS 256
@@ -273,7 +281,9 @@ static void null_replay(uint64_t handle) {
     for (const op_hdr *h = nvn_op_first(handle);; h = nvn_op_next(h)) {
         const void *a = nvn_op_payload(h);
         if (h->op < 64) __atomic_fetch_add(&op_hist[h->op], 1, __ATOMIC_RELAXED);
+        uint64_t t0 = mono_now();
         vkr_op(h, a);
+        if (h->op < 64) op_ns[h->op] += mono_now() - t0, op_cnt[h->op]++;
         switch (h->op) {
         case OP_END: return;
         case OP_SIGNAL_EVENT: {
@@ -314,6 +324,11 @@ static void null_replay(uint64_t handle) {
             const p_copy_b2b *b = a;
             void *s = null_cpu_addr(b->src, b->size, "buffer copy source"), *d = null_cpu_addr(b->dst, b->size, "buffer copy target");
             if (s && d) memmove(d, s, b->size);
+            {   /* how much the CPU copies for the game's buffer copies (logged every 5 s with the census) */
+                extern uint64_t g_b2b_bytes, g_b2b_n, g_b2b_max;
+                g_b2b_bytes += b->size, g_b2b_n++;
+                if (b->size > g_b2b_max) g_b2b_max = b->size;
+            }
             break;
         }
         case OP_CLEAR_BUF: {
@@ -333,10 +348,43 @@ static void null_replay(uint64_t handle) {
     }
 }
 
+uint64_t g_b2b_bytes, g_b2b_n, g_b2b_max;
+
 static uint64_t null_submit(const uint64_t *handles, int n) {
+    uint64_t tb = mono_now();
     vkr_submit_begin();
+    sub_begin_ns += mono_now() - tb;
     for (int i = 0; i < n; i++) null_replay(handles[i]);
+    uint64_t te = mono_now();
     vkr_submit_end();
+    sub_end_ns += mono_now() - te;
+    {
+        static uint64_t t0, subs;
+        uint64_t now = mono_now();
+        subs++;
+        if (!t0) t0 = now;
+        if (now - t0 >= 5000000000ull) {
+            som_log("gfx: buffer copies (CPU) %.1f MB/s in %.0f copies/s, largest %llu KB", (double)g_b2b_bytes / 1e6 / ((now - t0) / 1e9),
+                    (double)g_b2b_n / ((now - t0) / 1e9), (unsigned long long)(g_b2b_max >> 10));
+            /* where replay time goes, per submit: submit begin/end and the six most expensive op types */
+            char line[600];
+            int o = snprintf(line, sizeof line, "gfx: replay per submit (%llu submits): begin %.2f ms, end %.2f ms;", (unsigned long long)subs,
+                             sub_begin_ns / 1e6 / subs, sub_end_ns / 1e6 / subs);
+            for (int k = 0; k < 6 && o < (int)sizeof line - 60; k++) {
+                int best = -1;
+                for (int i = 0; i < 64; i++)
+                    if (op_ns[i] && (best < 0 || op_ns[i] > op_ns[best])) best = i;
+                if (best < 0) break;
+                o += snprintf(line + o, sizeof line - (size_t)o, " op %d: %.2f ms (%.0f x, %.1f us)", best, op_ns[best] / 1e6 / subs,
+                              (double)op_cnt[best] / subs, op_ns[best] / 1e3 / op_cnt[best]);
+                op_ns[best] = 0;
+            }
+            som_log("%s", line);
+            memset(op_ns, 0, sizeof op_ns), memset(op_cnt, 0, sizeof op_cnt);
+            sub_begin_ns = sub_end_ns = subs = 0;
+            g_b2b_bytes = g_b2b_n = g_b2b_max = 0, t0 = now;
+        }
+    }
     static uint64_t nsub;
     uint64_t k = ++nsub;
     if (k == 1 || (k & (k - 1)) == 0) {
@@ -357,8 +405,8 @@ static int null_fence_wait(uint64_t value, uint64_t timeout_ns) {
 static uint64_t null_fence_done(void) { return __atomic_load_n(&fence, __ATOMIC_ACQUIRE); }
 
 static void null_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
-    (void)crop, (void)at_ns;
-    vkr_present(t);
+    (void)at_ns;
+    vkr_present(t, crop);
     int i = (int)(t->serial % CLR_SLOTS);
     if (clr_tab[i].serial == t->serial) memcpy(som_gfx_color, clr_tab[i].rgba, 16);
     uint64_t np = __atomic_add_fetch(&som_gfx_presents, 1, __ATOMIC_RELAXED);

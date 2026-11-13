@@ -62,8 +62,11 @@ add_library(somniel SHARED
     nvn/shader_cache.c
     nvn/unity_scan.c
     nvn/tex_deswizzle.c
+    nvn/bc_decode.c
+    nvn/perf_hint.c
     hooks_hid.c
     hooks_movie.c
+    movies.c
     hooks_swkbd.c
     guest_asm.S
 )

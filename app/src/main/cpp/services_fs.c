@@ -15,6 +15,7 @@
 #include "debug_log.h"
 #include "guest.h"
 #include "ipc.h"
+#include "movies.h"
 
 static char g_data_dir[400];
 
@@ -76,6 +77,7 @@ static void storage_handler(IpcObject *self, const IpcRequest *rq, IpcResponse *
             last_end = off + size;
             pthread_mutex_unlock(&rl_mu);
         }
+        movies_note_read(off, size); /* which movie the game is about to play (movies.c) */
         uint8_t *dst = ipc_guest(rq->b[0].addr, size);
         uint64_t done = 0;
         extern uint64_t g_fs_read_ns, g_fs_read_bytes, g_fs_read_calls;

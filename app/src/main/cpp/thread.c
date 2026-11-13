@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <linux/futex.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <ucontext.h>
@@ -164,8 +165,38 @@ void kthread_exit_current(GuestCtx *ctx) {
  * SDK hook, the guest registers are already saved in its GuestCtx; the handler
  * snapshots those and the thread parks when it returns to the guest. */
 
-static pthread_mutex_t g_pause_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_pause_cv = PTHREAD_COND_INITIALIZER;
+/* No mutex anywhere on this path. The signal handler used to take a pthread mutex (and park in pthread_cond_wait),
+ * neither of which is async-signal-safe; the "stall: no submit" hangs ended with every guest thread asleep and the
+ * collector, plus paused threads returning from kernel calls, all queued on that mutex with no running owner
+ * (A17, 2026-11-12). Now: per-thread flags are atomics, a paused thread waits on the futex word g_pause_gen (bumped
+ * by every resume), and the pauser waits on the target's `paused` word. Both futex calls are signal-safe. */
+static volatile int g_pause_gen;
+
+static void fwait(volatile int *addr, int val, long ns) {
+    struct timespec ts = {ns / 1000000000l, ns % 1000000000l};
+    syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, val, ns ? &ts : NULL, NULL, 0);
+}
+static void fwake(volatile int *addr) { syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0); }
+
+static int want_pause(KThread *t) {
+    return __atomic_load_n(&t->pause_req, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_bg_pause, __ATOMIC_ACQUIRE);
+}
+
+/* acknowledge (the snapshot is already written) and wake the pauser */
+static void mark_paused(KThread *t) {
+    __atomic_store_n(&t->paused, 1, __ATOMIC_RELEASE);
+    fwake(&t->paused);
+}
+
+/* park until no pause is wanted: read the generation before testing, so a resume in between changes it and the
+ * futex wait returns at once */
+static void park(KThread *t) {
+    for (;;) {
+        int gen = __atomic_load_n(&g_pause_gen, __ATOMIC_ACQUIRE);
+        if (!want_pause(t)) return;
+        fwait(&g_pause_gen, gen, 0);
+    }
+}
 
 static void put64(uint8_t *b, size_t off, uint64_t v) { memcpy(b + off, &v, 8); }
 
@@ -222,34 +253,26 @@ void som_suspend_handler(int sig, void *info, void *uc, int in_guest) {
     (void)sig;
     (void)info;
     KThread *t = t_thread;
-    if (!t || !WANT_PAUSE(t)) return;
-    if (in_guest) snapshot_from_ucontext(t, uc);
-    else snapshot_from_ctx(t);
-    pthread_mutex_lock(&g_pause_mu);
-    t->paused = 1;
-    pthread_cond_broadcast(&g_pause_cv);
-    if (in_guest)
-        while (WANT_PAUSE(t)) pthread_cond_wait(&g_pause_cv, &g_pause_mu);
-    pthread_mutex_unlock(&g_pause_mu);
+    if (!t || !want_pause(t)) return;
+    /* already acknowledged (kthread_check_pause got there first): the collector may be reading the snapshot, leave it */
+    if (!__atomic_load_n(&t->paused, __ATOMIC_ACQUIRE)) {
+        if (in_guest) snapshot_from_ucontext(t, uc);
+        else snapshot_from_ctx(t);
+        mark_paused(t);
+    }
+    if (in_guest) park(t); /* in host code the thread parks when it returns to the guest (kthread_check_pause) */
 }
 
 void kthread_check_pause(void) {
     KThread *t = t_thread;
-    if (!t || !WANT_PAUSE(t)) return;
-    /* the suspend handler takes g_pause_mu too: with the signal unblocked, one landing while this thread holds the
-     * mutex would deadlock the thread on itself (the GC then waits for it forever) */
-    sigset_t blk, old;
-    sigemptyset(&blk);
-    sigaddset(&blk, SOM_SIG_SUSPEND);
-    pthread_sigmask(SIG_BLOCK, &blk, &old);
-    pthread_mutex_lock(&g_pause_mu);
-    while (WANT_PAUSE(t)) {
-        t->paused = 1;
-        pthread_cond_broadcast(&g_pause_cv);
-        pthread_cond_wait(&g_pause_cv, &g_pause_mu);
+    if (!t || !want_pause(t)) return;
+    /* a pause the signal already acknowledged (its snapshot of this thread's kernel-call registers stands); without one
+     * (the background pause, or the signal not delivered yet) take the snapshot here */
+    if (!__atomic_load_n(&t->paused, __ATOMIC_ACQUIRE)) {
+        snapshot_from_ctx(t);
+        mark_paused(t);
     }
-    pthread_mutex_unlock(&g_pause_mu);
-    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    park(t);
 }
 
 /* stop-the-world accounting for the stall report (svc.c som_stall_mark) */
@@ -263,52 +286,59 @@ uint32_t kthread_set_activity(uint32_t handle, uint32_t activity) {
     if (activity > 1) return RES_INVALID_ENUM;
     if (t == t_thread) return RES_INVALID_HANDLE; /* a thread cannot pause itself */
     if (activity == 1) {
-        if (t->pause_req || !t->started || t->finished || !t->linux_tid) return RES_INVALID_STATE;
-        pthread_mutex_lock(&g_pause_mu);
-        t->pause_req = 1;
-        t->paused = 0;
-        t->ctx_valid = 0;
-        pthread_mutex_unlock(&g_pause_mu);
+        if (!t->started || t->finished || !t->linux_tid) return RES_INVALID_STATE;
+        /* clear the acknowledgement first, then publish the request: whoever claims the request owns this pause */
+        if (__atomic_load_n(&t->pause_req, __ATOMIC_ACQUIRE)) return RES_INVALID_STATE;
+        __atomic_store_n(&t->ctx_valid, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&t->paused, 0, __ATOMIC_RELEASE);
+        int zero = 0;
+        if (!__atomic_compare_exchange_n(&t->pause_req, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return RES_INVALID_STATE;
+        static int stoppers;
+        static uint64_t overlaps;
+        int now_in = __atomic_add_fetch(&stoppers, 1, __ATOMIC_SEQ_CST);
+        if (now_in > 1 && (++overlaps & (overlaps - 1)) == 0)
+            som_log("pause: %d threads pausing at once (thread %llu pauses %llu; %llu times so far)", now_in,
+                    t_thread ? (unsigned long long)t_thread->id : 0ull, (unsigned long long)t->id, (unsigned long long)overlaps);
         syscall(SYS_tgkill, (int)getpid(), t->linux_tid, SOM_SIG_SUSPEND);
-        struct timespec dl;
+        /* wait for the acknowledgement (in 2 ms slices, then give up after 5 s). This thread may itself be paused
+         * meanwhile: its own handler only snapshots and returns here (it is in host code), and it parks at its next
+         * return to the guest. */
+        struct timespec dl, m;
         clock_gettime(CLOCK_MONOTONIC, &dl);
         dl.tv_sec += 5;
-        pthread_mutex_lock(&g_pause_mu);
-        while (!t->paused) {
-            struct timespec now;
-            clock_gettime(CLOCK_REALTIME, &now);
-            struct timespec abs = {now.tv_sec + 5, now.tv_nsec};
-            if (pthread_cond_timedwait(&g_pause_cv, &g_pause_mu, &abs) == ETIMEDOUT) {
+        while (!__atomic_load_n(&t->paused, __ATOMIC_ACQUIRE)) {
+            fwait(&t->paused, 0, 2000000);
+            clock_gettime(CLOCK_MONOTONIC, &m);
+            if (!__atomic_load_n(&t->paused, __ATOMIC_ACQUIRE) && (m.tv_sec > dl.tv_sec || (m.tv_sec == dl.tv_sec && m.tv_nsec >= dl.tv_nsec))) {
                 som_log("pause of thread %llu timed out", (unsigned long long)t->id);
                 break;
             }
         }
-        if (g_npaused++ == 0) {
+        if (__atomic_fetch_add(&g_npaused, 1, __ATOMIC_ACQ_REL) == 0) {
             clock_gettime(CLOCK_MONOTONIC, &g_world_stop);
             __atomic_fetch_add(&g_gc_pauses, 1, __ATOMIC_RELAXED);
         }
-        pthread_mutex_unlock(&g_pause_mu);
+        __atomic_sub_fetch(&stoppers, 1, __ATOMIC_SEQ_CST);
         return RES_OK;
     }
-    if (!t->pause_req) return RES_INVALID_STATE;
-    pthread_mutex_lock(&g_pause_mu);
-    if (g_npaused > 0 && --g_npaused == 0) { /* the collector let the last thread go: one stop-the-world ends */
+    int one = 1;
+    if (!__atomic_compare_exchange_n(&t->pause_req, &one, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return RES_INVALID_STATE;
+    if (__atomic_sub_fetch(&g_npaused, 1, __ATOMIC_ACQ_REL) == 0) { /* the collector let the last thread go */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         __atomic_fetch_add(&g_gc_pause_ns, (uint64_t)((now.tv_sec - g_world_stop.tv_sec) * 1000000000ll + (now.tv_nsec - g_world_stop.tv_nsec)), __ATOMIC_RELAXED);
     }
-    t->pause_req = 0;
-    t->paused = 0;
-    t->ctx_valid = 0;
-    pthread_cond_broadcast(&g_pause_cv);
-    pthread_mutex_unlock(&g_pause_mu);
+    __atomic_store_n(&t->ctx_valid, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->paused, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_pause_gen, 1, __ATOMIC_ACQ_REL);
+    fwake(&g_pause_gen);
     return RES_OK;
 }
 
 uint32_t kthread_get_context(uint32_t handle, void *out) {
     KThread *t = kobj_get(handle, KO_THREAD);
     if (!t) return RES_INVALID_HANDLE;
-    if (!t->paused || !t->ctx_valid) return RES_INVALID_STATE;
+    if (!__atomic_load_n(&t->paused, __ATOMIC_ACQUIRE) || !t->ctx_valid) return RES_INVALID_STATE;
     memcpy(out, t->ctx_buf, sizeof t->ctx_buf);
     return RES_OK;
 }
@@ -329,10 +359,68 @@ void som_guest_pause_all(int on) {
         }
         som_log("guest paused (%d threads signalled)", n);
     } else {
-        pthread_mutex_lock(&g_pause_mu);
         __atomic_store_n(&g_bg_pause, 0, __ATOMIC_SEQ_CST);
-        pthread_cond_broadcast(&g_pause_cv);
-        pthread_mutex_unlock(&g_pause_mu);
+        __atomic_add_fetch(&g_pause_gen, 1, __ATOMIC_ACQ_REL);
+        fwake(&g_pause_gen);
         som_log("guest resumed");
+    }
+}
+
+/* stall diagnostics: for each guest thread, its pause flags, the snapshot pc/lr when paused, and from /proc its Linux
+ * state, the CPU time it gained over 200 ms (spinning vs blocked) and the syscall it sits in (nr, sp, pc) */
+static int task_stat(int tid, char *state, unsigned long long *ticks) {
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    if (!p) return 0;
+    unsigned long long ut = 0, st = 0;
+    /* after ") ": state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime */
+    if (sscanf(p + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", state, &ut, &st) != 3) return 0;
+    *ticks = ut + st;
+    return 1;
+}
+
+void kthread_debug_dump(void) {
+    unsigned long long t0[128] = {0};
+    for (int i = 0; i < 128; i++) {
+        KThread *t = g_threads[i];
+        char s;
+        if (t && t->linux_tid) task_stat(t->linux_tid, &s, &t0[i]);
+    }
+    usleep(200000);
+    som_log("stall: threads: npaused %d bg_pause %d gen %d", __atomic_load_n(&g_npaused, __ATOMIC_ACQUIRE), g_bg_pause,
+            g_pause_gen);
+    for (int i = 0; i < 128; i++) {
+        KThread *t = g_threads[i];
+        if (!t) continue;
+        char s = '?', sc[160] = "";
+        unsigned long long t1 = 0;
+        if (t->linux_tid) {
+            task_stat(t->linux_tid, &s, &t1);
+            char path[64];
+            snprintf(path, sizeof path, "/proc/self/task/%d/syscall", t->linux_tid);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(sc, sizeof sc, f)) sc[strcspn(sc, "\n")] = 0;
+                fclose(f);
+            }
+        }
+        char where[200] = "";
+        if (t->ctx_valid) {
+            uint64_t pc, lr, off1 = 0, off2 = 0;
+            memcpy(&pc, t->ctx_buf + 0x100, 8);
+            memcpy(&lr, t->ctx_buf + 0xF0, 8);
+            const char *m1 = som_module_of(pc, &off1), *m2 = som_module_of(lr, &off2);
+            snprintf(where, sizeof where, " snap pc=%s+0x%llx lr=%s+0x%llx", m1 ? m1 : "?", (unsigned long long)off1,
+                     m2 ? m2 : "?", (unsigned long long)off2);
+        }
+        som_log("stall: thread id %llu handle 0x%x tid %d %s%s req %d paused %d ctx %d | %c +%llu ticks | svc 0x%llx | syscall %s%s",
+                (unsigned long long)t->id, t->handle, t->linux_tid, t->started ? "" : "unstarted ", t->finished ? "finished " : "",
+                t->pause_req, t->paused, t->ctx_valid, s, t1 - t0[i], t->ctx ? (unsigned long long)t->ctx->svc_num : 0ull, sc, where);
     }
 }

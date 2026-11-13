@@ -144,10 +144,17 @@ final class Telemetry {
     // ---- dialogs ----
 
     void showGpuWarning(Runnable then) {
+        String gpu = gpuName().isEmpty() ? "non-Adreno GPU" : gpuName();
+        boolean mali = gpuName().toLowerCase().contains("mali");
         AlertDialog d = new AlertDialog.Builder(act)
-                .setTitle("Your GPU is untested")
-                .setMessage("This device has a " + (gpuName().isEmpty() ? "non-Adreno GPU" : gpuName()) + ".\n\n"
-                        + "Somniel has only been tested on Qualcomm Adreno GPUs. Mali and Xclipse GPUs are untested and "
+                .setTitle(mali ? "Mali support is in early stages" : "Your GPU is untested")
+                .setMessage(mali
+                        ? "This device has a " + gpu + ".\n\n"
+                        + "Mali GPU support in Somniel is at an early stage and is likely to be broken: expect wrong "
+                        + "graphics, slowdowns, crashes or freezes.\n\n"
+                        + "Lower settings are in the sidebar under Graphics. Reports help us fix it."
+                        : "This device has a " + gpu + ".\n\n"
+                        + "Somniel has only been tested on Qualcomm Adreno GPUs. Xclipse and other GPUs are untested and "
                         + "unverified: the game may show wrong graphics, run slowly, or not start at all.\n\n"
                         + "You can still try it. Reports from the in-game sidebar help us fix it.")
                 .setCancelable(false)
