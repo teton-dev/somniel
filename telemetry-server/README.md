@@ -17,5 +17,6 @@ Server and tunnel start by themselves at boot (Task Scheduler, SYSTEM). `setup.b
 Client IPs are never stored or logged. Back up the `data` folder if you care about history.
 
 ## Privacy contract (keep the app's consent text in sync with this)
-Sent: random install id, app version, device model, SoC/GPU names, Android version, RAM, frame-rate totals,
-crash frames as library+offset. Never: names, accounts, IPs, paths, saves, game data.
+Sent: random install id, app version, device model, SoC/GPU names, Android version, RAM, frame-rate and frame-time totals
+(percentiles, count of frames over the goal with a coarse reason: guest, CPU, GPU wait, pipeline build, texture upload;
+pipelines built; heat-throttling status; seconds since launch), a per-report id (de-duplication), crash frames as library+offset. Never: names, accounts, IPs, paths, saves, game data.

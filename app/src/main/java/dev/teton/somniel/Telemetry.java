@@ -13,6 +13,9 @@ import android.opengl.GLES20;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.PowerManager;
+import android.os.Process;
+import android.os.SystemClock;
 import android.widget.CheckBox;
 import android.widget.FrameLayout;
 
@@ -39,7 +42,14 @@ import java.util.UUID;
  */
 final class Telemetry {
     static native String nativeGpu();          // "name|driver|vendor|vkapi" once Vulkan is up, "" before
-    static native double[] nativeTakePerf();   // secs, frames, longest gap ms, lowest window fps, >50 ms, >100 ms, windows
+    static native double[] nativeTakePerf();   // see the V_* layout in telemetry.c
+
+    // indices into nativeTakePerf() (keep in sync with the V_* enum in telemetry.c)
+    private static final int P_SECS = 0, P_FRAMES = 1, P_MAX_GAP = 2, P_MIN_FPS = 3, P_WINDOWS = 4, P_OVER50 = 5,
+            P_OVER100 = 6, P_OVER250 = 7, P_OVER1000 = 8, P_LONG_GAPS = 9, P_P50 = 10, P_P95 = 11, P_P99 = 12,
+            P_P999 = 13, P_HITCHES = 14, P_CAUSE0 = 15 /* guest, cpu, gpu, pipe, tex, other */, P_PIPES = 21,
+            P_PIPE_MS = 22, P_WIN_DROPPED = 23, P_TARGET_FPS = 24, P_COUNTED = 25, P_N = 26;
+    private static final String[] CAUSES = {"guest", "cpu", "gpu", "pipe", "tex", "other"};
 
     private static final long PERF_EVERY_MS = 5 * 60 * 1000L;
     private static final int QUEUE_MAX = 20;
@@ -52,6 +62,8 @@ final class Telemetry {
     private Handler handler;
     private boolean running;
     private String glRenderer = "";
+    private volatile int thermalMax;       // highest PowerManager thermal status since the last report (0 none .. 6 shutdown)
+    private boolean thermalListening;
 
     Telemetry(SomnielActivity act) {
         this.act = act;
@@ -183,7 +195,8 @@ final class Telemetry {
         AlertDialog d = new AlertDialog.Builder(act)
                 .setTitle("Share anonymous data?")
                 .setMessage("Help improve Somniel by sharing anonymous performance and crash data.\n\n"
-                        + "Shared: device model, chipset and GPU names, Android version, RAM, frame-rate totals, "
+                        + "Shared: device model, chipset and GPU names, Android version, RAM, frame-rate and frame-time "
+                        + "totals (including a rough reason for slow frames and the device's heat-throttling state), "
                         + "and crash locations (library and offset only), tied to a random ID.\n\n"
                         + "Never shared: your name, accounts, IP address, files, saves or game data.\n\n"
                         + "You can change this any time in the sidebar.")
@@ -204,6 +217,31 @@ final class Telemetry {
         if (handler == null) handler = new Handler(thread.getLooper());
         handler.postDelayed(this::tick, 45_000); // the GPU name is known by then; the first window has data
         handler.post(this::sendPending);
+        listenThermal();
+    }
+
+    /** Throttling is the usual reason for a device that was fine a minute ago: remember the worst status per report. */
+    private void listenThermal() {
+        if (thermalListening) return;
+        try {
+            PowerManager pm = (PowerManager) act.getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return;
+            thermalMax = pm.getCurrentThermalStatus();
+            pm.addThermalStatusListener(r -> handler.post(r), s -> { if (s > thermalMax) thermalMax = s; });
+            thermalListening = true;
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private int takeThermalMax() {
+        int m = thermalMax;
+        try {
+            PowerManager pm = (PowerManager) act.getSystemService(Context.POWER_SERVICE);
+            thermalMax = pm == null ? 0 : pm.getCurrentThermalStatus();
+        } catch (Throwable t) {
+            thermalMax = 0;
+        }
+        return m;
     }
 
     private synchronized void stop() {
@@ -229,14 +267,29 @@ final class Telemetry {
     private void collect(boolean unused) {
         try {
             double[] p = nativeTakePerf();
-            if (p == null || p[6] < 1 || p[0] < 10) return; // under 10 s of presented frames is not a sample
+            if (p == null || p.length < P_N || p[P_WINDOWS] < 1 || p[P_SECS] < 10) return; // under 10 s of presented frames is not a sample
             JSONObject perf = new JSONObject();
-            perf.put("seconds", Math.round(p[0]));
-            perf.put("fps_avg", Math.round(p[1] / p[0] * 10) / 10.0);
-            perf.put("fps_low_window", Math.round(p[3] * 10) / 10.0);
-            perf.put("longest_frame_ms", Math.round(p[2]));
-            perf.put("over_50ms", (int) p[4]);
-            perf.put("over_100ms", (int) p[5]);
+            perf.put("seconds", Math.round(p[P_SECS]));
+            perf.put("fps_avg", Math.round(p[P_FRAMES] / p[P_SECS] * 10) / 10.0);
+            perf.put("fps_low_window", Math.round(p[P_MIN_FPS] * 10) / 10.0);
+            perf.put("longest_frame_ms", Math.round(p[P_MAX_GAP]));
+            perf.put("over_50ms", (int) p[P_OVER50]);
+            perf.put("over_100ms", (int) p[P_OVER100]);
+            perf.put("over_250ms", (int) p[P_OVER250]);
+            perf.put("over_1000ms", (int) p[P_OVER1000]);
+            perf.put("long_gaps", (int) p[P_LONG_GAPS]);   // gaps over 5 s between frames: freezes, not counted in the rest
+            perf.put("p50_ms", (int) p[P_P50]);
+            perf.put("p95_ms", (int) p[P_P95]);
+            perf.put("p99_ms", (int) p[P_P99]);
+            perf.put("p999_ms", (int) p[P_P999]);
+            perf.put("target_fps", (int) p[P_TARGET_FPS]); // 0 = follows the game
+            perf.put("hitches", (int) p[P_HITCHES]);       // frames over 1.5 target periods (25 ms at 60, 50 ms at 30)
+            for (int k = 0; k < CAUSES.length; k++) perf.put("hitch_" + CAUSES[k], (int) p[P_CAUSE0 + k]);
+            perf.put("pipes_built", (int) p[P_PIPES]);
+            perf.put("pipe_ms", Math.round(p[P_PIPE_MS]));
+            perf.put("windows_dropped", (int) p[P_WIN_DROPPED]); // 5 s windows thrown away for touching the background
+            perf.put("thermal_max", takeThermalMax());
+            perf.put("up_s", Math.max(0, (SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime()) / 1000));
             JSONObject o = base("perf");
             o.put("perf", perf);
             enqueue(o);
@@ -249,6 +302,7 @@ final class Telemetry {
         o.put("v", 1);
         o.put("type", type);
         o.put("install", installId());
+        o.put("rid", UUID.randomUUID().toString().substring(0, 18)); // the server drops a re-sent copy of the same report
         o.put("ts", System.currentTimeMillis() / 1000);
         o.put("app", BuildVersion.name(act));
         JSONObject dev = new JSONObject();

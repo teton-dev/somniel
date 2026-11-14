@@ -199,6 +199,7 @@ static bool lifecycle_watch(void *ud, SDL_Event *e) {
     if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND && g_gfx) {
         pthread_mutex_lock(&g_gfx_mu);
         som_log("entering background (watch)");
+        tel_set_foreground(0);
         g_background = true;
         g_want_surface = false;
         destroy_surface(g_gfx);
@@ -209,6 +210,7 @@ static bool lifecycle_watch(void *ud, SDL_Event *e) {
         }
     } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND && g_gfx) {
         som_log("entering foreground (watch)");
+        tel_set_foreground(1);
         if (g_spike_mode) {
             som_audio_pause_all(0);
             som_guest_pause_all(0);

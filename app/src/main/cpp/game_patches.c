@@ -22,6 +22,7 @@
  * changed (the settings then do nothing). */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "debug_log.h"
@@ -29,6 +30,7 @@
 #include "hook.h"
 
 uint64_t rt_call(GuestCtx *c, uint64_t fn, int n, ...); /* nvn_glue.c */
+extern const char *som_data_dir(void);
 
 static const uint8_t kMainBuildId[16] = {0x8c, 0x08, 0xb9, 0x71, 0x9e, 0x08, 0x5f, 0x91,
                                          0x84, 0x7b, 0x5e, 0x0f, 0x93, 0x5d, 0x94, 0x88};
@@ -248,6 +250,55 @@ static void graphics_frame(GuestCtx *c) {
     }
 }
 
+/* Dynamic game speed. The game steps by ticks of 1/60 s per frame; a fixed count per frame means game time runs slow
+ * whenever the device cannot hold the chosen frame rate. Instead, the ticks per frame follow the measured frame time
+ * (smoothed), from the frame rate's own count (60/F) up to DYN_MAX_TICKS (3 ticks = a 20 fps floor): at 45 fps on a 60
+ * fps setting a frame advances 1.33 ticks and the game still runs at normal speed. Below 20 fps it slows down after
+ * all. Within DYN_DEADBAND of the nominal frame time the exact nominal count is used, so a device that holds its rate
+ * behaves exactly as before. <data>/no_dynspeed turns it off (for A/B runs). */
+#define DYN_MAX_TICKS 3.0
+#define DYN_DEADBAND  0.08
+#define DYN_ALPHA     0.15
+#define DYN_STALL_NS  250000000ull /* a longer gap is a load, a pause or a lock screen, not a frame time */
+static volatile float g_ticks_f = 1.0f; /* ticks this frame advances, on average (hub speed scale = this / 2) */
+static volatile float g_hub_k = 0.5f;   /* 30 / F while the speed is nominal (60 fps until the first frame) */
+static int g_dyn_off = -1;
+
+static void dyn_speed_update(double nominal) {
+    static uint64_t last_ns;
+    static double ema;
+    static int last_fps;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (g_dyn_off < 0) {
+        char p[600];
+        snprintf(p, sizeof p, "%s/no_dynspeed", som_data_dir());
+        g_dyn_off = access(p, F_OK) == 0;
+        som_log("patches: dynamic game speed %s (floor 20 fps)", g_dyn_off ? "off (no_dynspeed)" : "on");
+    }
+    if (g_fps != last_fps || !ema) last_fps = g_fps, ema = nominal;
+    double dt = last_ns ? (double)(now - last_ns) : 0.0;
+    last_ns = now;
+    if (!g_dyn_off && dt > 0.0 && dt < (double)DYN_STALL_NS) {
+        double raw = dt * 60.0 * 1e-9; /* ticks of 1/60 s the last frame took */
+        if (raw < nominal) raw = nominal;
+        if (raw > DYN_MAX_TICKS) raw = DYN_MAX_TICKS;
+        ema += (raw - ema) * DYN_ALPHA;
+    } else if (g_dyn_off) {
+        ema = nominal;
+    }
+    double t = ema < nominal * (1.0 + DYN_DEADBAND) ? nominal : ema;
+    static double logged;
+    static uint64_t log_ns;
+    if ((t - logged > 0.25 || logged - t > 0.25 || (t == nominal && logged != nominal)) && now - log_ns > 1000000000ull) {
+        som_log("speed: %.2f ticks/frame (%.1f fps equivalent, nominal %.2f)", t, 60.0 / t, nominal);
+        logged = t, log_ns = now;
+    }
+    g_ticks_f = (float)t;
+    g_hub_k = (float)(t * 0.5);
+}
+
 /* GameTime.Update, once per frame on the main thread */
 static void on_frame(GuestCtx *c) {
     graphics_frame(c);
@@ -255,7 +306,8 @@ static void on_frame(GuestCtx *c) {
     static double acc;
     int fps = g_fps;
     if (fps != last_fps) last_fps = fps, acc = 0;
-    acc += 60.0 / fps;
+    dyn_speed_update(60.0 / fps);
+    acc += g_ticks_f;
     int n = (int)(acc + 1e-9);
     if (n < 1) n = 1;
     acc -= n;
@@ -340,9 +392,9 @@ static void on_pp_aa(GuestCtx *c) {
 }
 
 /* HubUtil.Params getters, after the load: s0 holds the value */
-static void on_hub_linear(GuestCtx *c) { set_float(c, 0, get_float(c, 0) * (30.0f / (float)g_fps)); }
+static void on_hub_linear(GuestCtx *c) { set_float(c, 0, get_float(c, 0) * g_hub_k); }
 static void on_hub_accel(GuestCtx *c) {
-    float k = 30.0f / (float)g_fps;
+    float k = g_hub_k;
     set_float(c, 0, get_float(c, 0) * k * k);
 }
 

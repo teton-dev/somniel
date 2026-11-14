@@ -115,6 +115,9 @@ static struct {
     uint64_t presents, last_present, max_gap;
     uint32_t over50, over100;
 } PW;
+/* Time since the previous present, by where it went (telemetry: why a frame missed its goal). Written by the submit
+ * thread (pf_end), drained by vkr_present. */
+static struct { uint64_t guest, cpu, gpu, pipe, tex, n_pipe; } FA;
 static uint64_t pf_begin; /* start of this submit */
 #define PF_T0() uint64_t pf_t0_ = now_ns()
 #define PF_T1(k) (PS.t[k] += now_ns() - pf_t0_)
@@ -3610,6 +3613,15 @@ static void pf_end(uint64_t now, uint64_t nsub) {
     PW.s.n_pass += PS.n_pass, PW.s.n_pipe += PS.n_pipe, PW.s.n_tex += PS.n_tex, PW.s.n_shader += PS.n_shader, PW.s.n_set += PS.n_set;
     PW.s.n_dedup += PS.n_dedup, PW.s.n_late += PS.n_late, PW.s.n_lclear += PS.n_lclear;
     PW.submits++, PW.draws += R.draws, PW.t_replay += replay, PW.t_guest += guest;
+    {
+        uint64_t pipe = PS.t[PF_PIPE] + PS.t[PF_SHADER], tex = PS.t[PF_TEX];
+        __atomic_fetch_add(&FA.guest, guest, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&FA.cpu, replay > pipe + tex ? replay - pipe - tex : 0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&FA.gpu, PS.t[PF_WAIT], __ATOMIC_RELAXED);
+        __atomic_fetch_add(&FA.pipe, pipe, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&FA.tex, tex, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&FA.n_pipe, PS.n_pipe, __ATOMIC_RELAXED);
+    }
     if (total > PW.max_total) PW.max_total = total;
     char l[500];
     if (total > 40000000ull && PW.slow++ < 25) {
@@ -3626,7 +3638,7 @@ static void pf_end(uint64_t now, uint64_t nsub) {
             secs, (double)presents / secs, (double)gap / 1e6, o50, o100, n / secs, PW.slow, (double)PW.t_replay / 1e6 / n,
             (double)PW.s.t[PF_WAIT] / 1e6 / n, (double)PW.t_guest / 1e6 / n, (double)PW.max_total / 1e6, (double)PW.draws / n, l);
     gp_report();
-    tel_perf_window(secs, (double)presents, (double)gap / 1e6, o50, o100);
+    tel_perf_window(secs, (double)presents);
     uint64_t le = PW.last_end, lp = PW.last_present;
     memset(&PW, 0, sizeof PW);
     PW.last_end = le, PW.last_present = lp, PW.start = now;
@@ -4183,6 +4195,16 @@ void vkr_present(const tex_t *t, const int crop[4]) {
             static uint64_t win_start;
             static unsigned win_n;
             if (now - win_start > 1000000000ull) win_start = now, win_n = 0;
+            {   /* telemetry: always drain the per-frame accumulators; the cause is only used for a frame over its goal */
+                uint64_t v[5] = {__atomic_exchange_n(&FA.guest, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&FA.cpu, 0, __ATOMIC_RELAXED),
+                                 __atomic_exchange_n(&FA.gpu, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&FA.pipe, 0, __ATOMIC_RELAXED),
+                                 __atomic_exchange_n(&FA.tex, 0, __ATOMIC_RELAXED)};
+                uint64_t np = __atomic_exchange_n(&FA.n_pipe, 0, __ATOMIC_RELAXED);
+                int best = 0;
+                for (int k = 1; k < 5; k++) if (v[k] > v[best]) best = k;
+                /* TEL_CAUSE_* order is guest, cpu, gpu, pipe, tex; under half the gap accounted for = unattributed */
+                tel_frame(gap, limit, v[best] * 2 < gap ? TEL_CAUSE_OTHER : best, (unsigned)np, v[3], fps);
+            }
             if (gap > limit && win_n < 4) {
                 char lb[64];
                 snprintf(lb, sizeof lb, "long frame %.0f ms", (double)gap / 1e6);

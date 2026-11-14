@@ -45,6 +45,23 @@ with db_lock:
     CREATE INDEX IF NOT EXISTS perf_ts ON perf(ts);
     CREATE INDEX IF NOT EXISTS crash_ts ON crashes(ts);
     """)
+    # Columns added in app 0.1.6 (older rows keep NULL). rid = per-report id: a re-sent report is ignored.
+    NEW_PERF = [("rid", "TEXT"), ("over250", "INTEGER"), ("over1000", "INTEGER"), ("long_gaps", "INTEGER"),
+                ("p50", "INTEGER"), ("p95", "INTEGER"), ("p99", "INTEGER"), ("p999", "INTEGER"),
+                ("target_fps", "INTEGER"), ("hitches", "INTEGER"), ("h_guest", "INTEGER"), ("h_cpu", "INTEGER"),
+                ("h_gpu", "INTEGER"), ("h_pipe", "INTEGER"), ("h_tex", "INTEGER"), ("h_other", "INTEGER"),
+                ("pipes_built", "INTEGER"), ("pipe_ms", "INTEGER"), ("windows_dropped", "INTEGER"),
+                ("thermal_max", "INTEGER"), ("up_s", "INTEGER")]
+    have = {r[1] for r in db.execute("PRAGMA table_info(perf)")}
+    for col, typ in NEW_PERF:
+        if col not in have:
+            db.execute("ALTER TABLE perf ADD COLUMN %s %s" % (col, typ))
+    have = {r[1] for r in db.execute("PRAGMA table_info(crashes)")}
+    if "rid" not in have:
+        db.execute("ALTER TABLE crashes ADD COLUMN rid TEXT")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS perf_rid ON perf(install, rid) WHERE rid IS NOT NULL")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS crash_rid ON crashes(install, rid) WHERE rid IS NOT NULL")
+    db.commit()
 
 rate = {}  # install -> [window_start, count]
 rate_lock = threading.Lock()
@@ -86,6 +103,9 @@ def ingest(o):
     gpu = s(d.get("vk_name") or d.get("gl_renderer"))
     soc = s(d.get("soc") or d.get("hardware"))
     app = s(o.get("app"), 40)
+    rid = s(o.get("rid"), 18) or None
+    if rid and not re.fullmatch(r"[0-9a-f-]{8,18}", rid):
+        rid = None
     now = int(time.time())
     with db_lock:
         db.execute(
@@ -97,19 +117,26 @@ def ingest(o):
              int(num(d.get("ram_gb"), 0, 1024))))
         if typ == "perf" and isinstance(o.get("perf"), dict):
             p = o["perf"]
-            db.execute("INSERT INTO perf(ts,install,app,gpu,soc,seconds,fps_avg,fps_low,longest_ms,over50,over100) "
-                       "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                       (now, install, app, gpu, soc, int(num(p.get("seconds"), 0, 10**6)),
-                        num(p.get("fps_avg"), 0, 1000), num(p.get("fps_low_window"), 0, 1000),
-                        int(num(p.get("longest_frame_ms"), 0, 10**7)), int(num(p.get("over_50ms"))),
-                        int(num(p.get("over_100ms")))))
+            def i(k, hi=10**9):  # NULL when an older app did not send the field
+                return None if p.get(k) is None else int(num(p.get(k), 0, hi))
+            db.execute("INSERT OR IGNORE INTO perf(ts,install,app,gpu,soc,seconds,fps_avg,fps_low,longest_ms,over50,over100,"
+                       "rid,over250,over1000,long_gaps,p50,p95,p99,p999,target_fps,hitches,h_guest,h_cpu,h_gpu,h_pipe,h_tex,"
+                       "h_other,pipes_built,pipe_ms,windows_dropped,thermal_max,up_s) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (now, install, app, gpu, soc, i("seconds", 10**6), num(p.get("fps_avg"), 0, 1000),
+                        num(p.get("fps_low_window"), 0, 1000), i("longest_frame_ms", 10**7), i("over_50ms"),
+                        i("over_100ms"), rid, i("over_250ms"), i("over_1000ms"), i("long_gaps"),
+                        i("p50_ms", 1000), i("p95_ms", 1000), i("p99_ms", 1000), i("p999_ms", 1000),
+                        i("target_fps", 1000), i("hitches"), i("hitch_guest"), i("hitch_cpu"), i("hitch_gpu"),
+                        i("hitch_pipe"), i("hitch_tex"), i("hitch_other"), i("pipes_built"), i("pipe_ms", 10**8),
+                        i("windows_dropped"), i("thermal_max", 6), i("up_s", 10**8)))
         elif typ == "crash" and isinstance(o.get("crash"), dict):
             c = o["crash"]
             frames = [s(c.get("frame%d" % i), 80) for i in range(10) if c.get("frame%d" % i)]
             sig = "|".join(frames[:3])  # grouping key: top three frames
-            db.execute("INSERT INTO crashes(ts,install,app,gpu,soc,kind,signal,sig,frames) VALUES(?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT OR IGNORE INTO crashes(ts,install,app,gpu,soc,kind,signal,sig,frames,rid) VALUES(?,?,?,?,?,?,?,?,?,?)",
                        (now, install, app, gpu, soc, s(c.get("kind"), 10), s(c.get("signal"), 6), sig,
-                        "\n".join(frames)))
+                        "\n".join(frames), rid))
         else:
             return 400
         db.commit()
@@ -143,6 +170,19 @@ def dashboard():
             "SELECT gpu, COUNT(DISTINCT install), SUM(seconds), SUM(fps_avg*seconds)/SUM(seconds), MIN(fps_low), "
             "SUM(over50)*3600.0/SUM(seconds) FROM perf WHERE ts>? AND seconds>0 GROUP BY gpu "
             "ORDER BY SUM(seconds) DESC", (week,))]))
+    parts.append("<h2>Frame goal misses by GPU (7 days, app 0.1.6+; goal = 1.5 target periods: 25 ms at 60 fps, 50 ms at 30)</h2>")
+    parts.append(table(["GPU", "Hours", "p99 ms (worst report)", "Misses /h", "% guest", "% cpu", "% gpu wait", "% pipeline",
+                        "% texture", "% unclear", "Pipelines built /h", "Max thermal"], [
+        (r[0], round(r[1] / 3600, 2), r[2], round(r[3], 1), *[round(100.0 * x / r[4], 0) if r[4] else 0 for x in r[5:11]],
+         round(r[11], 1), r[12]) for r in q(
+            "SELECT gpu, SUM(seconds), MAX(p99), SUM(hitches)*3600.0/SUM(seconds), SUM(hitches), SUM(h_guest), SUM(h_cpu), "
+            "SUM(h_gpu), SUM(h_pipe), SUM(h_tex), SUM(h_other), SUM(pipes_built)*3600.0/SUM(seconds), MAX(thermal_max) "
+            "FROM perf WHERE ts>? AND seconds>0 AND hitches IS NOT NULL GROUP BY gpu ORDER BY SUM(seconds) DESC", (week,))]))
+    parts.append("<h2>Startup (first 2 min after launch) vs later, per GPU (app 0.1.6+)</h2>")
+    parts.append(table(["GPU", "Phase", "Reports", "Misses per report", "Longest ms (avg)", "Pipelines built per report"], [
+        (r[0], r[1], r[2], round(r[3], 1), round(r[4]), round(r[5], 1)) for r in q(
+            "SELECT gpu, CASE WHEN up_s<=120 THEN 'startup' ELSE 'later' END, COUNT(*), AVG(hitches), AVG(longest_ms), "
+            "AVG(pipes_built) FROM perf WHERE ts>? AND hitches IS NOT NULL GROUP BY 1, 2 ORDER BY gpu, 2 DESC", (week,))]))
     parts.append("<h2>Chipsets (devices seen in 30 days)</h2>")
     parts.append(table(["SoC", "GPU", "Devices"], q(
         "SELECT soc, gpu, COUNT(*) FROM devices WHERE last_seen>? GROUP BY soc, gpu ORDER BY COUNT(*) DESC",

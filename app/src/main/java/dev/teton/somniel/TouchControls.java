@@ -2,7 +2,9 @@ package dev.teton.somniel;
 
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
 import android.os.Handler;
 import android.os.Looper;
@@ -11,18 +13,18 @@ import android.view.MotionEvent;
 import android.view.View;
 
 /**
- * Transparent on-screen gamepad for phones. The layout follows Microsoft's touch-layout guidance (primary actions under
- * the thumbs in the lower corners, infrequent buttons in the upper zone, the lower centre left empty, the most used
- * button the biggest, forgiving relative sticks):
- *   lower left  : left stick (relative: it re-centres where the thumb lands), the game's walking and cursor stick
- *   left, middle: D-pad
- *   lower right : A (largest), B, X, Y diamond
- *   right, middle: right stick (relative), the camera
- *   top corners : L / ZL and R / ZR; top centre: Minus and Plus
+ * Transparent on-screen gamepad for phones. The layout follows a familiar Switch-emulator arrangement, with the infrequent
+ * buttons kept out of the way and the most used button the biggest:
+ *   lower left      : left stick (relative: it re-centres where the thumb lands), the game's walking and cursor stick
+ *   left of centre  : D-pad (four chevron keys)
+ *   right of centre : right stick (relative), the camera
+ *   lower right     : A (largest), B, X, Y diamond; A and B are a little bigger than X and Y
+ *   upper corners   : ZL, L and R, ZR side by side; top centre: Minus and Plus
+ * L3 / R3 and a menu button are left out: the game has no use for them, and Back (the gesture) opens the sidebar.
  * Multi-touch: every finger is tracked on its own, a finger can slide from one button to the next, and a stick keeps the
  * finger that first touched it. The controls fade to FADED_ALPHA after IDLE_MS without a touch and come back at the next
- * touch. Back (the gesture) still opens the sidebar. The state goes to the native input through nativeTouchPad; button
- * bits match main.c's NP_* enum. The layout is drawn in a 360-unit-high space scaled to the view's height.
+ * touch. The state goes to the native input through nativeTouchPad; button bits match main.c's NP_* enum. The layout is
+ * drawn in an 800 x 360 unit space scaled to fit the view.
  */
 final class TouchControls extends View {
     static final long A = 1L << 0, B = 1L << 1, X = 1L << 2, Y = 1L << 3, L = 1L << 6, R = 1L << 7, ZL = 1L << 8,
@@ -62,14 +64,17 @@ final class TouchControls extends View {
     // sticks: [0] left, [1] right. home = resting place, c = where the base is drawn now (relative sticks move it)
     private final float[] homeX = new float[2], homeY = new float[2], cX = new float[2], cY = new float[2];
     private final float[] stickR = new float[2], knobR = new float[2];
-    private float dpadX, dpadY, dpadR;
+    private float dpadX, dpadY, dpadR; // dpadR = distance from the centre to each key
     private final int[] stickPtr = { NONE, NONE };
     private final float[] knobDx = new float[2], knobDy = new float[2];
 
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), line = new Paint(Paint.ANTI_ALIAS_FLAG),
-            text = new Paint(Paint.ANTI_ALIAS_FLAG);
+            text = new Paint(Paint.ANTI_ALIAS_FLAG), guide = new Paint(Paint.ANTI_ALIAS_FLAG),
+            chev = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF rect = new RectF();
+    private final Path path = new Path();
     private Canvas canvas;
+    private float sc = 1f; // view pixels per layout unit
 
     private boolean showDpad = true, showLeftStick = true, fadeOn = true;
     private Listener listener;
@@ -111,32 +116,39 @@ final class TouchControls extends View {
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
-        float s = h / 360f;
-        stickR[0] = 52 * s; knobR[0] = 22 * s;
-        stickR[1] = 36 * s; knobR[1] = 16 * s;             // the camera stick is used less: smaller
-        homeX[0] = 118 * s; homeY[0] = h - 90 * s;         // left stick, lower left, a little in from the edge
-        homeX[1] = w - 88 * s; homeY[1] = 130 * s;         // right stick, above the face buttons
+        float s = sc = Math.max(0.1f, Math.min(h / 360f, w / 800f));
+        stickR[0] = 56 * s; knobR[0] = 24 * s;
+        stickR[1] = 50 * s; knobR[1] = 22 * s;             // the camera stick is used less: a little smaller
+        homeX[0] = 114 * s; homeY[0] = h - 132 * s;        // left stick, lower left
+        homeX[1] = w - 263 * s; homeY[1] = h - 96 * s;     // right stick, left of the face buttons
         for (int i = 0; i < 2; i++) { cX[i] = homeX[i]; cY[i] = homeY[i]; }
         placeDpad();
-        float fx = w - 92 * s, fy = h - 92 * s, o = 40 * s;
-        place(a, fx + o, fy, 26 * s);                      // A: the most used, the biggest
-        place(b, fx, fy + o, 22 * s);
-        place(x, fx, fy - o, 20 * s);
-        place(y, fx - o, fy, 20 * s);
-        place(minus, w / 2f - 46 * s, h - 28 * s, 15 * s);   // bottom centre
-        place(plus, w / 2f + 46 * s, h - 28 * s, 15 * s);
-        pill(zl, 58 * s, 24 * s, 38 * s, 15 * s);
-        pill(l, 58 * s, 58 * s, 38 * s, 15 * s);
-        pill(zr, w - 58 * s, 24 * s, 38 * s, 15 * s);
-        pill(r, w - 58 * s, 58 * s, 38 * s, 15 * s);
-        line.setStrokeWidth(Math.max(2f, 1.8f * s));
+        float fx = w - 127 * s, fy = h - 125 * s, o = 47 * s;
+        place(a, fx + o, fy, 31 * s);                      // A: the most used, the biggest
+        place(b, fx, fy + o, 27 * s);                      // B: next
+        place(x, fx, fy - o, 23 * s);
+        place(y, fx - o, fy, 23 * s);
+        place(minus, w / 2f - 34 * s, 28 * s, 13 * s);     // top centre
+        place(plus, w / 2f + 34 * s, 28 * s, 13 * s);
+        pill(zl, 54 * s, 112 * s, 50 * s, 24 * s);         // shoulders: two wide keys side by side
+        pill(l, 158 * s, 112 * s, 50 * s, 24 * s);
+        pill(zr, w - 54 * s, 112 * s, 50 * s, 24 * s);
+        pill(r, w - 158 * s, 112 * s, 50 * s, 24 * s);
+        line.setStrokeWidth(Math.max(1.5f, 1.6f * s));
+        guide.setStyle(Paint.Style.STROKE);
+        guide.setStrokeWidth(Math.max(1f, 1.2f * s));
+        guide.setPathEffect(new DashPathEffect(new float[] { 3 * s, 5 * s }, 0));
+        chev.setStyle(Paint.Style.STROKE);
+        chev.setStrokeCap(Paint.Cap.ROUND);
+        chev.setStrokeJoin(Paint.Join.ROUND);
+        chev.setStrokeWidth(Math.max(2f, 2.6f * s));
     }
 
-    /** The D-pad sits left and dropped when the left stick is shown too; alone it is bigger and takes the stick's place. */
+    /** The D-pad sits left of centre; alone (no left stick) it is bigger and takes the stick's place. */
     private void placeDpad() {
-        float s = getHeight() / 360f;
-        if (showLeftStick) { dpadX = 80 * s; dpadY = 178 * s; dpadR = 42 * s; }
-        else { dpadX = homeX[0]; dpadY = homeY[0]; dpadR = 60 * s; }
+        float s = sc;
+        if (showLeftStick) { dpadX = 256 * s; dpadY = getHeight() - 84 * s; dpadR = 48 * s; }
+        else { dpadX = homeX[0]; dpadY = homeY[0]; dpadR = 56 * s; }
     }
 
     private static void place(Btn b, float cx, float cy, float r) { b.cx = cx; b.cy = cy; b.r = r; }
@@ -199,7 +211,7 @@ final class TouchControls extends View {
     }
 
     private boolean onDpad(float px, float py) {
-        return showDpad && Math.hypot(px - dpadX, py - dpadY) <= dpadR * 1.4f;
+        return showDpad && Math.hypot(px - dpadX, py - dpadY) <= dpadR * 1.5f;
     }
 
     private boolean onButton(float px, float py) {
@@ -221,9 +233,9 @@ final class TouchControls extends View {
         if (!showDpad) return bits;
         float dx = px - dpadX, dy = py - dpadY;
         float d = (float) Math.hypot(dx, dy);
-        if (d <= dpadR * 1.4f && d > dpadR * 0.2f) {
+        if (d <= dpadR * 1.5f && d > dpadR * 0.2f) {
             // 4-way: only the dominant axis counts (this game has no use for diagonals), so a thumb that drifts off
-            // an arm never produces two directions at once
+            // a key never produces two directions at once
             if (Math.abs(dx) >= Math.abs(dy)) bits |= dx < 0 ? LEFT : RIGHT;
             else bits |= dy < 0 ? UP : DOWN;
         }
@@ -257,63 +269,76 @@ final class TouchControls extends View {
 
     // ---- drawing ----
 
-    private static final int IDLE = 0x40303030, ON_FILL = 0x66FFFFFF, EDGE = 0x80FFFFFF, EDGE_ON = 0xCCFFFFFF;
+    private static final int FILL = 0x52141A20, FILL_ON = 0x88FFFFFF, EDGE = 0xB0FFFFFF, EDGE_ON = 0xFFFFFFFF,
+            SHADOW = 0x40000000;
+
+    /** A rounded body (a circle when hw == hh == corner): a dark halo for contrast, the fill, a thin light edge. */
+    private void body(float cx, float cy, float hw, float hh, float corner, int fillCol, int edgeCol) {
+        rect.set(cx - hw, cy - hh, cx + hw, cy + hh);
+        float w = line.getStrokeWidth();
+        line.setStrokeWidth(w + 2.2f * sc);
+        line.setColor(SHADOW);
+        canvas.drawRoundRect(rect, corner, corner, line);
+        line.setStrokeWidth(w);
+        fill.setStyle(Paint.Style.FILL);
+        fill.setColor(fillCol);
+        canvas.drawRoundRect(rect, corner, corner, fill);
+        line.setColor(edgeCol);
+        canvas.drawRoundRect(rect, corner, corner, line);
+    }
 
     private void disc(float cx, float cy, float rad, boolean on) {
-        fill.setStyle(Paint.Style.FILL);
-        fill.setColor(on ? ON_FILL : IDLE);
-        line.setColor(on ? EDGE_ON : EDGE);
-        canvas.drawCircle(cx, cy, rad, fill);
-        canvas.drawCircle(cx, cy, rad, line);
+        if (on) rad *= 1.06f;
+        body(cx, cy, rad, rad, rad, on ? FILL_ON : FILL, on ? EDGE_ON : EDGE);
     }
 
     private void label(String s, float cx, float cy, boolean on, float size) {
         text.setTextSize(size);
-        text.setColor(on ? 0xFFFFFFFF : 0xCCFFFFFF);
+        text.setColor(on ? 0xFFFFFFFF : 0xE6FFFFFF);
+        text.setShadowLayer(2.5f * sc, 0, sc, 0x99000000);
         canvas.drawText(s, cx, cy - (text.ascent() + text.descent()) / 2f, text);
     }
 
     @Override
     protected void onDraw(Canvas c) {
         canvas = c;
-        float s = getHeight() / 360f;
+        float s = sc;
         for (Btn t : btns) {
             boolean on = (buttons & t.bit) != 0;
             if (t.pill) {
-                rect.set(t.cx - t.hw, t.cy - t.hh, t.cx + t.hw, t.cy + t.hh);
-                fill.setStyle(Paint.Style.FILL);
-                fill.setColor(on ? ON_FILL : IDLE);
-                line.setColor(on ? EDGE_ON : EDGE);
-                c.drawRoundRect(rect, t.hh, t.hh, fill);
-                c.drawRoundRect(rect, t.hh, t.hh, line);
+                float k = on ? 1.04f : 1f;
+                body(t.cx, t.cy, t.hw * k, t.hh * k, 16 * s, on ? FILL_ON : FILL, on ? EDGE_ON : EDGE);
             } else {
                 disc(t.cx, t.cy, t.r, on);
             }
-            label(t.label, t.cx, t.cy, on, (t == a ? 17 : 14) * s);
+            float size = t == a ? 19 : t == b ? 17 : t == minus || t == plus ? 18 : t.pill ? 14 : 16;
+            label(t.label, t.cx, t.cy, on, size * s);
         }
-        // D-pad: a plus of four arms
-        float arm = dpadR * 0.36f;
+        // D-pad: four rounded keys with chevrons
         long[] dirs = { UP, DOWN, LEFT, RIGHT };
+        float half = dpadR * 0.46f, k = dpadR * 0.2f;
         for (int i = 0; showDpad && i < 4; i++) {
             boolean on = (buttons & dirs[i]) != 0;
             float ox = i == 2 ? -1 : i == 3 ? 1 : 0, oy = i == 0 ? -1 : i == 1 ? 1 : 0;
-            float cx = dpadX + ox * dpadR * 0.62f, cy = dpadY + oy * dpadR * 0.62f;
-            rect.set(cx - (ox != 0 ? dpadR * 0.38f : arm), cy - (oy != 0 ? dpadR * 0.38f : arm),
-                    cx + (ox != 0 ? dpadR * 0.38f : arm), cy + (oy != 0 ? dpadR * 0.38f : arm));
-            fill.setStyle(Paint.Style.FILL);
-            fill.setColor(on ? ON_FILL : IDLE);
-            line.setColor(on ? EDGE_ON : EDGE);
-            c.drawRoundRect(rect, arm * 0.5f, arm * 0.5f, fill);
-            c.drawRoundRect(rect, arm * 0.5f, arm * 0.5f, line);
+            float cx = dpadX + ox * dpadR, cy = dpadY + oy * dpadR, hs = on ? half * 1.06f : half;
+            body(cx, cy, hs, hs, hs * 0.38f, on ? FILL_ON : FILL, on ? EDGE_ON : EDGE);
+            chev.setColor(on ? 0xFFFFFFFF : 0xE6FFFFFF);
+            path.rewind();
+            path.moveTo(cx - ox * k * 0.45f - oy * k, cy - oy * k * 0.45f + ox * k);
+            path.lineTo(cx + ox * k * 0.55f, cy + oy * k * 0.55f);
+            path.lineTo(cx - ox * k * 0.45f + oy * k, cy - oy * k * 0.45f - ox * k);
+            c.drawPath(path, chev);
         }
-        // sticks: base ring (moves to where a thumb landed) plus a knob that follows the finger
+        // sticks: base ring with a dashed guide (moves to where a thumb landed) plus a knob that follows the finger
         for (int i = showLeftStick ? 0 : 1; i < 2; i++) {
-            fill.setStyle(Paint.Style.FILL);
-            fill.setColor(0x22000000);
-            line.setColor(0x66FFFFFF);
-            c.drawCircle(cX[i], cY[i], stickR[i], fill);
-            c.drawCircle(cX[i], cY[i], stickR[i], line);
-            disc(cX[i] + knobDx[i], cY[i] + knobDy[i], knobR[i], stickPtr[i] != NONE);
+            body(cX[i], cY[i], stickR[i], stickR[i], stickR[i], 0x26101418, 0x78FFFFFF);
+            guide.setColor(0x50FFFFFF);
+            c.drawCircle(cX[i], cY[i], stickR[i] * 0.74f, guide);
+            float kx = cX[i] + knobDx[i], ky = cY[i] + knobDy[i];
+            boolean on = stickPtr[i] != NONE;
+            disc(kx, ky, knobR[i], on);
+            guide.setColor(on ? 0xA0FFFFFF : 0x60FFFFFF);
+            c.drawCircle(kx, ky, knobR[i] * 0.58f, guide);
         }
         canvas = null;
     }
