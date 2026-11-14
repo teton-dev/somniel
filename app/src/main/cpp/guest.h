@@ -54,6 +54,10 @@ typedef struct MemInfo {
 } MemInfo;
 
 void guest_region_set(uint64_t base, uint64_t size, uint32_t type, uint32_t perm);
+/* Bumped whenever guest memory can stop being readable (unmap, protection change, heap shrink). The dual-screen host
+ * caches validated regions per thread and drops them when this changes. Additions need no bump. */
+extern volatile uint64_t g_map_epoch;
+static inline void guest_map_bump(void) { __atomic_fetch_add(&g_map_epoch, 1, __ATOMIC_RELEASE); }
 void guest_query(uint64_t addr, MemInfo *out);
 
 /* address-space layout reported to the guest through svc GetInfo */

@@ -1,0 +1,1085 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eden DSMod fork
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+cmake_minimum_required(VERSION 3.22)
+project(eden-dsmod-native-modules LANGUAGES CXX)
+
+if(ANDROID AND NOT ANDROID_STL STREQUAL "c++_static")
+    message(FATAL_ERROR "Native DSMod modules must use -DANDROID_STL=c++_static")
+endif()
+
+# Farming Simulator Nintendo Switch Edition: accepted-A private desktop development slice.
+# Reuse the companion DDS decoder; the game's SDF font is rasterised in its page compositor.
+set(FARMING_SIMULATOR_SOURCES farming_simulator_assets.cpp farming_simulator_font.cpp
+    farming_simulator_view.cpp farming_simulator_animals.cpp farming_simulator_shop_views.cpp
+    p5r_romfs_assets.cpp)
+set(FARMING_SIMULATOR_READER)
+set(FARMING_SIMULATOR_DEFINITIONS)
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/farming_simulator_reader.cpp")
+    list(APPEND FARMING_SIMULATOR_READER farming_simulator_reader.cpp)
+    list(APPEND FARMING_SIMULATOR_DEFINITIONS FARMING_SIMULATOR_HAS_READER=1)
+endif()
+# Declared after dsmod_add_module below.
+
+# This directory is intentionally usable as an independent CMake source tree. Android packages
+# build it outside Gradle's .cxx tree, so the resulting title module is never auto-packaged into
+# the generic Eden APK.
+set(EDEN_SOURCE_ROOT "" CACHE PATH "Compatible Eden Duo checkout (v1.1.0 or its SDK-compatible successor)")
+if(NOT IS_ABSOLUTE "${EDEN_SOURCE_ROOT}")
+    message(FATAL_ERROR "Set -DEDEN_SOURCE_ROOT=/absolute/path/to/eden-duo; see native/README.md")
+endif()
+foreach(header IN ITEMS dsmod_module_abi.h dsmod_module_extensions.h modules/dsmod_module_sdk.h)
+    if(NOT EXISTS "${EDEN_SOURCE_ROOT}/src/core/mods/${header}")
+        message(FATAL_ERROR "Eden Duo SDK header missing: ${header}")
+    endif()
+endforeach()
+set(EDEN_CPM_CACHE "${EDEN_SOURCE_ROOT}/.cache/cpm" CACHE PATH
+    "Eden CPM cache containing header-only module dependencies")
+
+find_path(EDEN_FMT_INCLUDE_DIR fmt/format.h
+    HINTS "${EDEN_CPM_CACHE}/fmt/12.1.0/include"
+    NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+find_path(EDEN_NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
+    HINTS "${EDEN_CPM_CACHE}/nlohmann_json/v3.12.0/include"
+    NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+
+# dsmod_add_module(<target> TITLE <title id> SOURCES <file>... EXPORTS <symbol>...
+#                  [EXCLUDE_FROM_ALL] [INCLUDE_DIRECTORIES <dir>...] [COMPILE_DEFINITIONS <def>...])
+# One title module: <title id>.so with hidden visibility, C++20, the ABI headers and the module
+# SDK. EXPORTS is the complete dynamic symbol list; the version script generated from it hides
+# everything else (local: *), so a getter defined in the source but not listed stays private.
+function(dsmod_add_module target)
+    cmake_parse_arguments(PARSE_ARGV 1 ARG "EXCLUDE_FROM_ALL" "TITLE"
+        "SOURCES;EXPORTS;INCLUDE_DIRECTORIES;COMPILE_DEFINITIONS")
+    if(NOT ARG_TITLE OR NOT ARG_SOURCES OR NOT ARG_EXPORTS OR ARG_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "dsmod_add_module(${target}): TITLE, SOURCES and EXPORTS are required "
+            "(unparsed: ${ARG_UNPARSED_ARGUMENTS})")
+    endif()
+    set(exclude)
+    if(ARG_EXCLUDE_FROM_ALL)
+        set(exclude EXCLUDE_FROM_ALL)
+    endif()
+    add_library(${target} SHARED ${exclude}
+        ${ARG_SOURCES}
+        "${EDEN_SOURCE_ROOT}/src/core/mods/modules/dsmod_module_sdk.h"
+        "${EDEN_SOURCE_ROOT}/src/core/mods/dsmod_module_abi.h"
+        "${EDEN_SOURCE_ROOT}/src/core/mods/dsmod_module_extensions.h")
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${EDEN_SOURCE_ROOT}/src"
+        ${ARG_INCLUDE_DIRECTORIES})
+    if(ARG_COMPILE_DEFINITIONS)
+        target_compile_definitions(${target} PRIVATE ${ARG_COMPILE_DEFINITIONS})
+    endif()
+    set_target_properties(${target} PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "${ARG_TITLE}"
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    if(UNIX AND NOT APPLE)
+        set(script "{\n    global:\n")
+        foreach(symbol IN LISTS ARG_EXPORTS)
+            string(APPEND script "        ${symbol};\n")
+        endforeach()
+        string(APPEND script "    local:\n        *;\n};\n")
+        set(script_file "${CMAKE_CURRENT_BINARY_DIR}/${target}.exports")
+        file(GENERATE OUTPUT "${script_file}" CONTENT "${script}")
+        target_link_options(${target} PRIVATE
+            "-Wl,--no-undefined"
+            "-Wl,--version-script=${script_file}")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${script_file}")
+    endif()
+    if(ANDROID)
+        target_link_options(${target} PRIVATE "-Wl,--exclude-libs,ALL")
+    endif()
+endfunction()
+
+option(BUILD_TESTING "Build companion test executables" OFF)
+include(CTest)
+
+# Persona 3 Portable (base game build): camp menu, battle, Tartarus map, dialogue and native-menu drives.
+dsmod_add_module(dsmod-p3p EXCLUDE_FROM_ALL
+    TITLE 0100DCD01525A000
+    SOURCES 0100DCD01525A000.cpp p3p_reader.h p3p_pins.inc p3p_font.h p3p_art.h p3p_map.h p3p_help.h p3p_talk.h p3p_drive.h p5r_font.h
+        p5r_romfs_assets.cpp p5r_romfs_assets.h
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+    INCLUDE_DIRECTORIES "${EDEN_FMT_INCLUDE_DIR}" "${EDEN_NLOHMANN_JSON_INCLUDE_DIR}"
+    COMPILE_DEFINITIONS FMT_HEADER_ONLY=1)
+option(EDEN_P3P_STANDALONE "Configure only the P3P development module" OFF)
+if(NOT ANDROID)
+    if(BUILD_TESTING)
+        add_executable(p3p-module-test p3p_module_test.cpp)
+        add_test(NAME dsmod-p3p COMMAND p3p-module-test)
+    else()
+        add_executable(p3p-module-test EXCLUDE_FROM_ALL p3p_module_test.cpp)
+    endif()
+    target_compile_features(p3p-module-test PRIVATE cxx_std_20)
+    target_include_directories(p3p-module-test PRIVATE "${EDEN_SOURCE_ROOT}/src")
+    target_link_libraries(p3p-module-test PRIVATE dsmod-p3p)
+endif()
+if(EDEN_P3P_STANDALONE)
+    return()
+endif()
+
+# Metroid Dread romfs access + Mercury reflection reader (asset-free package: map data from the
+# user's own .bmmap/.brfld). dread_rfl_types.inc is generated by tools/gen_dread_rfl_types.py.
+set(DREAD_ROMFS_SOURCES dread_romfs.cpp dread_romfs.h dread_rfl.cpp dread_rfl.h dread_rfl_types.inc)
+# The map generator: the package's map data (areas JSON + geometry blobs) rebuilt from romfs.
+set(DREAD_MAPGEN_SOURCES dread_mapgen.cpp dread_mapgen.h dread_mapgen_util.cpp dread_mapgen_util.h
+    dread_maproom.cpp dread_maproom.h)
+# The generator reproduces the Python bakers' double arithmetic bit for bit: no fused multiply-add
+# contraction (clang contracts a*b+c within an expression by default on arm64).
+set_source_files_properties(dread_mapgen.cpp dread_mapgen_util.cpp dread_maproom.cpp
+    PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+
+# Metroid Dread. get_font_extensions is exported, so the host decodes the package font (MFNT)
+# with this module's DecodeFont and the runtime's in-core ParseMfnt runs only as the fallback.
+# Dread modules built before the font extension existed export get_module alone and rely on that
+# fallback. Both decoders give identical FontMetrics for every MFNT font in the game.
+dsmod_add_module(dsmod-dread EXCLUDE_FROM_ALL
+    TITLE 010093801237C000
+    SOURCES 010093801237C000.cpp ${DREAD_ROMFS_SOURCES} ${DREAD_MAPGEN_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+        eden_dsmod_get_data_extensions
+    INCLUDE_DIRECTORIES "${EDEN_FMT_INCLUDE_DIR}" "${EDEN_NLOHMANN_JSON_INCLUDE_DIR}"
+    COMPILE_DEFINITIONS FMT_HEADER_ONLY=1)
+
+# MK8D: ABI glue (0100152000022000.cpp), the reader (mk8d_reader + its generated code pins:
+# mk8d_pins.inc for 4.0.0, mk8d_pins401.inc for 4.0.1, mk8d_pins303.inc + mk8d_pins303_ctgp.inc for 3.0.3 and CTGP-DX), the
+# asset side (mk8d_assets: romfs art, map cameras, message text, font advances) and the
+# id -> name rules (mk8d_ids) and the rank table's card-swap animation (mk8d_anim, used by the glue).
+set(MK8D_ASSET_SOURCES
+    mk8d_assets.cpp
+    mk8d_assets.h
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp")
+set(MK8D_READER_SOURCES
+    mk8d_reader.cpp
+    mk8d_reader.h
+    mk8d_pins.inc
+    mk8d_pins401.inc
+    mk8d_pins303.inc
+    mk8d_pins303_ctgp.inc
+    mk8d_ids.cpp
+    mk8d_ids.h)
+set(MK8D_ANIM_SOURCES
+    mk8d_anim.cpp
+    mk8d_anim.h)
+set(MK8D_MODULE_SOURCES
+    0100152000022000.cpp
+    ${MK8D_READER_SOURCES}
+    ${MK8D_ANIM_SOURCES}
+    ${MK8D_ASSET_SOURCES})
+# The minimap projection reproduces the game's float math; keep arm64 and x86-64 identical.
+set_source_files_properties(mk8d_assets.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+dsmod_add_module(dsmod-mk8d EXCLUDE_FROM_ALL
+    TITLE 0100152000022000
+    SOURCES ${MK8D_MODULE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_write_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+
+# Crash Team Racing Nitro-Fueled 1.0.15: race reader (ranks, positions, track, laps, the live
+# minimap widget) and pictures composed from the player's romfs (Alchemy igArchive/IGZ, raw LZMA,
+# BC3 via the shared BC decoder, the game's bitmap fonts).
+set(CTR_ASSET_SOURCES ctr_lzma.cpp ctr_lzma.h ctr_alchemy.cpp ctr_alchemy.h ctr_art.cpp ctr_art.h
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp")
+dsmod_add_module(dsmod-ctr EXCLUDE_FROM_ALL
+    TITLE 0100F9F00C696000
+    SOURCES 0100F9F00C696000.cpp ctr_reader.cpp ctr_reader.h ${CTR_ASSET_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+
+# Super Mario Bros. Wonder 1.2.1: read-only reader, globals resolved from accessor code, art
+# decoded from the player's romfs (zstd -> SARC -> BNTX). zstd's decompressor is compiled in
+# from the emulator's CPM cache (decoder only, no asm, so Linux and Android build the same code).
+enable_language(C)
+file(GLOB WONDER_ZSTD_LIB LIST_DIRECTORIES true "${EDEN_CPM_CACHE}/zstd/*/lib")
+list(LENGTH WONDER_ZSTD_LIB zstd_count)
+if(NOT zstd_count EQUAL 1)
+    message(FATAL_ERROR "Expected one zstd source in ${EDEN_CPM_CACHE}/zstd; configure the compatible Eden Duo checkout first")
+endif()
+list(GET WONDER_ZSTD_LIB 0 WONDER_ZSTD_LIB)
+set(WONDER_ZSTD_SOURCES
+    "${WONDER_ZSTD_LIB}/common/entropy_common.c"
+    "${WONDER_ZSTD_LIB}/common/error_private.c"
+    "${WONDER_ZSTD_LIB}/common/fse_decompress.c"
+    "${WONDER_ZSTD_LIB}/common/xxhash.c"
+    "${WONDER_ZSTD_LIB}/common/zstd_common.c"
+    "${WONDER_ZSTD_LIB}/decompress/huf_decompress.c"
+    "${WONDER_ZSTD_LIB}/decompress/zstd_ddict.c"
+    "${WONDER_ZSTD_LIB}/decompress/zstd_decompress.c"
+    "${WONDER_ZSTD_LIB}/decompress/zstd_decompress_block.c")
+set_source_files_properties(${WONDER_ZSTD_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "ZSTD_DISABLE_ASM=1;ZSTD_MULTITHREAD=0;XXH_NAMESPACE=WONDER_")
+set(WONDER_ASSET_SOURCES
+    wonder_assets.cpp
+    wonder_assets.h
+    wonder_catalog.cpp
+    wonder_catalog.h
+    wonder_font.cpp
+    wonder_font.h
+    wonder_glyphs.cpp
+    wonder_glyphs.h
+    third_party/stb_truetype.h
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+    ${WONDER_ZSTD_SOURCES})
+dsmod_add_module(dsmod-wonder EXCLUDE_FROM_ALL
+    TITLE 010015100B514000
+    SOURCES 010015100B514000.cpp ${WONDER_ASSET_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder" "${WONDER_ZSTD_LIB}")
+if (NOT ANDROID)
+    add_executable(wonder-assets-tool EXCLUDE_FROM_ALL wonder_assets_tool.cpp ${WONDER_ASSET_SOURCES})
+    target_compile_features(wonder-assets-tool PRIVATE cxx_std_20)
+    target_include_directories(wonder-assets-tool PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${EDEN_SOURCE_ROOT}/src"
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder" "${WONDER_ZSTD_LIB}")
+    add_executable(wonder-font-tool EXCLUDE_FROM_ALL wonder_font_tool.cpp ${WONDER_ASSET_SOURCES})
+    target_compile_features(wonder-font-tool PRIVATE cxx_std_20)
+    target_include_directories(wonder-font-tool PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${EDEN_SOURCE_ROOT}/src"
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder" "${WONDER_ZSTD_LIB}")
+    add_executable(wonder-catalog-tool EXCLUDE_FROM_ALL wonder_catalog_tool.cpp ${WONDER_ASSET_SOURCES})
+    target_compile_features(wonder-catalog-tool PRIVATE cxx_std_20)
+    target_include_directories(wonder-catalog-tool PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${EDEN_SOURCE_ROOT}/src"
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder" "${WONDER_ZSTD_LIB}")
+    add_executable(wonder-glyph-tool EXCLUDE_FROM_ALL wonder_glyph_tool.cpp ${WONDER_ASSET_SOURCES})
+    target_compile_features(wonder-glyph-tool PRIVATE cxx_std_20)
+    target_include_directories(wonder-glyph-tool PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${EDEN_SOURCE_ROOT}/src"
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder" "${WONDER_ZSTD_LIB}")
+endif()
+
+# P5R: the ABI glue (01005CA01580E000.cpp) plus the Reader's area files (p5r_reader.h lists them).
+set(P5R_READER_SOURCES
+    01005CA01580E000.cpp
+    p5r_reader.h
+    p5r_reader_actions.cpp
+    p5r_reader_assets.cpp
+    p5r_reader_battle.cpp
+    p5r_reader_bgm.cpp
+    p5r_reader_core.cpp
+    p5r_reader_dialogue.cpp
+    p5r_reader_direct.cpp
+    p5r_reader_drive.cpp
+    p5r_reader_inventory.cpp
+    p5r_reader_map.cpp
+    p5r_reader_party.cpp
+    p5r_reader_persona.cpp
+    p5r_reader_social.cpp)
+dsmod_add_module(dsmod-p5r EXCLUDE_FROM_ALL
+    TITLE 01005CA01580E000
+    SOURCES
+        ${P5R_READER_SOURCES}
+        01005CA01580E000.h
+        p5r_bgm_reader.h
+        p5r_dialogue_reader.h
+        p5r_direct_write.h
+        p5r_analyze_reader.h
+        p5r_battle2_reader.h
+        p5r_enemy_names.h
+        p5r_enemy_reader.h
+        p5r_map_reader.h
+        p5r_map_assets.h
+        p5r_font.h
+        p5r_recipes.h
+        p5r_social_reader.h
+        p5r_persona_reader.h
+        p5r_social_menu_reader.h
+        p5r_inventory_reader.h
+        p5r_map_overlay.h
+        p5r_prewarm.h
+        p5r_publish_filter.h
+        p5r_romfs_assets.cpp
+        p5r_romfs_assets.h
+        p5r_task_walk.h
+    EXPORTS
+        eden_dsmod_get_module
+        eden_dsmod_get_extensions
+        eden_dsmod_get_font_extensions
+        eden_dsmod_get_write_extensions)
+
+# dsmod_add_test(<name> SOURCES <file>... [KEEP_ASSERTS] [INCLUDE_DIRECTORIES <dir>...]
+#                [COMPILE_OPTIONS <opt>...] [COMPILE_DEFINITIONS <def>...])
+# A standalone unit test: executable <name>-test, registered with CTest as <name>. KEEP_ASSERTS
+# keeps assert() live in Release builds (those tests assert calls with side effects).
+function(dsmod_add_test name)
+    cmake_parse_arguments(PARSE_ARGV 1 ARG "KEEP_ASSERTS" ""
+        "SOURCES;INCLUDE_DIRECTORIES;COMPILE_OPTIONS;COMPILE_DEFINITIONS")
+    if(NOT ARG_SOURCES OR ARG_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "dsmod_add_test(${name}): SOURCES is required "
+            "(unparsed: ${ARG_UNPARSED_ARGUMENTS})")
+    endif()
+    add_executable(${name}-test ${ARG_SOURCES})
+    target_compile_features(${name}-test PRIVATE cxx_std_20)
+    target_include_directories(${name}-test PRIVATE "${CMAKE_CURRENT_LIST_DIR}" "${EDEN_SOURCE_ROOT}/src"
+        ${ARG_INCLUDE_DIRECTORIES})
+    if(ARG_COMPILE_DEFINITIONS)
+        target_compile_definitions(${name}-test PRIVATE ${ARG_COMPILE_DEFINITIONS})
+    endif()
+    if(ARG_COMPILE_OPTIONS)
+        target_compile_options(${name}-test PRIVATE ${ARG_COMPILE_OPTIONS})
+    endif()
+    if(ARG_KEEP_ASSERTS)
+        if(MSVC)
+            target_compile_options(${name}-test PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${name}-test PRIVATE -UNDEBUG)
+        endif()
+    endif()
+    add_test(NAME ${name} COMMAND ${name}-test)
+endfunction()
+
+# Echoes of Wisdom 1.1.0: native resources and read-only companion state.
+set(ECHOES_TEXTURE_SOURCES acnh_tex.cpp
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp")
+set(ECHOES_RESOURCE_SOURCES echoes_catalog.cpp echoes_inventory_catalog.cpp echoes_story.cpp echoes_player.cpp echoes_map_assets.cpp echoes_map_labels.cpp echoes_map_markers.cpp echoes_quest_markers.cpp echoes_landmarks.cpp echoes_entrances.cpp echoes_map_annotations.cpp echoes_map_annotation_reader.cpp echoes_warp.cpp echoes_dungeon.cpp echoes_dungeon_assets.cpp echoes_dungeon_variants.cpp echoes_prologue.cpp echoes_prologue_fonts.cpp echoes_font_reader.cpp echoes_fonts.cpp
+    echoes_resources.cpp ${ECHOES_TEXTURE_SOURCES})
+set(ECHOES_MODULE_SOURCES echoes_module.cpp echoes_reader.cpp echoes_selector.cpp echoes_live.cpp
+    echoes_drive.cpp echoes_context.cpp echoes_inventory.cpp echoes_menu.cpp echoes_menu_drive.cpp echoes_stamps.cpp echoes_stamp_bridge.cpp echoes_map.cpp
+    echoes_assets.cpp echoes_map_icon_assets.cpp echoes_dungeon_icons.cpp echoes_dungeon_reader.cpp echoes_warp_menu.cpp echoes_warp_drive.cpp echoes_warp_choice.cpp ${ECHOES_RESOURCE_SOURCES})
+dsmod_add_module(dsmod-echoes EXCLUDE_FROM_ALL TITLE 01008CF01BAAC000
+    SOURCES ${ECHOES_MODULE_SOURCES}
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder"
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions
+        eden_dsmod_get_font_extensions eden_dsmod_get_data_extensions)
+if(BUILD_TESTING AND NOT ANDROID)
+    dsmod_add_test(dsmod-echoes-reader KEEP_ASSERTS
+        SOURCES echoes_reader_test.cpp echoes_reader.cpp)
+    dsmod_add_test(dsmod-echoes-selector KEEP_ASSERTS
+        SOURCES echoes_selector_test.cpp echoes_selector.cpp)
+    dsmod_add_test(dsmod-echoes-automatons KEEP_ASSERTS
+        SOURCES echoes_automatons_test.cpp)
+    dsmod_add_test(dsmod-echoes-live KEEP_ASSERTS
+        SOURCES echoes_live_test.cpp echoes_live.cpp echoes_reader.cpp echoes_selector.cpp)
+    dsmod_add_test(dsmod-echoes-module KEEP_ASSERTS
+        SOURCES echoes_module_test.cpp ${ECHOES_MODULE_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-echoes-catalog KEEP_ASSERTS
+        SOURCES echoes_catalog_test.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-catalog PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-drive KEEP_ASSERTS
+        SOURCES echoes_drive_test.cpp echoes_drive.cpp)
+    dsmod_add_test(dsmod-echoes-inventory KEEP_ASSERTS
+        SOURCES echoes_inventory_test.cpp echoes_inventory.cpp)
+    dsmod_add_test(dsmod-echoes-asset-cache KEEP_ASSERTS
+        SOURCES echoes_asset_cache_test.cpp)
+    dsmod_add_test(dsmod-echoes-code-guard KEEP_ASSERTS
+        SOURCES echoes_code_guard_test.cpp)
+    dsmod_add_test(dsmod-echoes-context KEEP_ASSERTS
+        SOURCES echoes_context_test.cpp echoes_context.cpp echoes_reader.cpp)
+    dsmod_add_test(dsmod-echoes-menu KEEP_ASSERTS
+        SOURCES echoes_menu_test.cpp echoes_menu.cpp echoes_context.cpp)
+    set_tests_properties(dsmod-echoes-menu PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-menu-drive KEEP_ASSERTS
+        SOURCES echoes_menu_drive_test.cpp echoes_menu_drive.cpp)
+    dsmod_add_test(dsmod-echoes-stamps KEEP_ASSERTS
+        SOURCES echoes_stamps_test.cpp echoes_stamps.cpp)
+    dsmod_add_test(dsmod-echoes-stamp-bridge KEEP_ASSERTS
+        SOURCES echoes_stamp_bridge_test.cpp echoes_stamps.cpp echoes_stamp_bridge.cpp)
+    dsmod_add_test(dsmod-echoes-map-annotations KEEP_ASSERTS
+        SOURCES echoes_map_annotations_test.cpp echoes_map_annotations.cpp echoes_map_annotation_reader.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-map-annotations PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-map-annotation-reader KEEP_ASSERTS
+        SOURCES echoes_map_annotation_reader_test.cpp echoes_map_annotations.cpp echoes_map_annotation_reader.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-map-annotation-reader PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-map-labels KEEP_ASSERTS
+        SOURCES echoes_map_labels_test.cpp echoes_map_labels.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-map-labels PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-map-markers KEEP_ASSERTS
+        SOURCES echoes_map_markers_test.cpp echoes_map_markers.cpp)
+    dsmod_add_test(dsmod-echoes-quest-markers KEEP_ASSERTS
+        SOURCES echoes_quest_markers_test.cpp echoes_quest_markers.cpp echoes_map_markers.cpp echoes_catalog.cpp)
+    dsmod_add_test(dsmod-echoes-entrances KEEP_ASSERTS
+        SOURCES echoes_entrances_test.cpp echoes_entrances.cpp)
+    dsmod_add_test(dsmod-echoes-landmarks KEEP_ASSERTS
+        SOURCES echoes_landmarks_test.cpp echoes_landmarks.cpp echoes_map_annotation_reader.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-map-markers dsmod-echoes-quest-markers dsmod-echoes-landmarks
+        dsmod-echoes-entrances
+        PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-dungeon-view KEEP_ASSERTS
+        SOURCES echoes_dungeon_view_test.cpp)
+    dsmod_add_test(dsmod-echoes-dungeon KEEP_ASSERTS
+        SOURCES echoes_dungeon_test.cpp echoes_dungeon.cpp)
+    dsmod_add_test(dsmod-echoes-dungeon-variants KEEP_ASSERTS
+        SOURCES echoes_dungeon_variants_test.cpp echoes_dungeon_variants.cpp)
+    dsmod_add_test(dsmod-echoes-dungeon-icons KEEP_ASSERTS
+        SOURCES echoes_dungeon_icons_test.cpp)
+    dsmod_add_test(dsmod-echoes-dungeon-reader KEEP_ASSERTS
+        SOURCES echoes_dungeon_reader_test.cpp echoes_dungeon_reader.cpp)
+    set_tests_properties(dsmod-echoes-dungeon dsmod-echoes-dungeon-reader dsmod-echoes-dungeon-variants PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-warp-choice KEEP_ASSERTS
+        SOURCES echoes_warp_choice_test.cpp)
+    dsmod_add_test(dsmod-echoes-warp-menu KEEP_ASSERTS
+        SOURCES echoes_warp_menu_test.cpp echoes_warp.cpp echoes_map_annotations.cpp echoes_map_annotation_reader.cpp echoes_catalog.cpp)
+    dsmod_add_test(dsmod-echoes-warp-drive KEEP_ASSERTS
+        SOURCES echoes_warp_drive_test.cpp echoes_warp_drive.cpp echoes_warp.cpp echoes_map_annotations.cpp echoes_map_annotation_reader.cpp echoes_catalog.cpp)
+    dsmod_add_test(dsmod-echoes-warp KEEP_ASSERTS
+        SOURCES echoes_warp_test.cpp echoes_warp.cpp echoes_map_annotations.cpp echoes_map_annotation_reader.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-warp PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-prologue KEEP_ASSERTS
+        SOURCES echoes_prologue_test.cpp echoes_prologue.cpp echoes_map_annotations.cpp echoes_map_annotation_reader.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-prologue PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-map KEEP_ASSERTS
+        SOURCES echoes_map_test.cpp echoes_map.cpp echoes_reader.cpp)
+    dsmod_add_test(dsmod-echoes-story KEEP_ASSERTS
+        SOURCES echoes_story_test.cpp echoes_story.cpp)
+    dsmod_add_test(dsmod-echoes-player KEEP_ASSERTS
+        SOURCES echoes_player_test.cpp echoes_player.cpp echoes_map.cpp echoes_reader.cpp)
+    set_tests_properties(dsmod-echoes-player PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-inventory-catalog KEEP_ASSERTS
+        SOURCES echoes_inventory_catalog_test.cpp echoes_inventory_catalog.cpp echoes_catalog.cpp)
+    set_tests_properties(dsmod-echoes-inventory-catalog PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-echoes-font-reader KEEP_ASSERTS
+        SOURCES echoes_font_reader_test.cpp echoes_font_reader.cpp)
+    dsmod_add_test(dsmod-echoes-fonts KEEP_ASSERTS
+        SOURCES echoes_fonts_test.cpp echoes_fonts.cpp echoes_font_reader.cpp acnh_tex.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-echoes-prologue-fonts KEEP_ASSERTS
+        SOURCES echoes_prologue_fonts_test.cpp echoes_prologue_fonts.cpp echoes_fonts.cpp
+            echoes_font_reader.cpp acnh_tex.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-echoes-resources KEEP_ASSERTS
+        SOURCES echoes_resources_test.cpp echoes_reader.cpp ${ECHOES_RESOURCE_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    # Standalone texture tests use the host CPU ASTC decoder with a synchronous
+    # build-only worker, as lp-unity-tool does. Production uses host decode_astc.
+    set(echoes_shim_dir "${CMAKE_CURRENT_BINARY_DIR}/echoes_astc_shim")
+    file(WRITE "${echoes_shim_dir}/video_core/textures/workers.h" [=[
+// Generated by native/modules/CMakeLists.txt; test-only synchronous texture worker.
+#pragma once
+#include <utility>
+namespace Common {
+class ThreadWorker {
+public:
+    template <typename F> void QueueWork(F&& work) { std::forward<F>(work)(); }
+    void WaitForRequests() {}
+};
+}
+namespace Tegra::Texture {
+inline Common::ThreadWorker& GetThreadWorkers() {
+    static Common::ThreadWorker workers;
+    return workers;
+}
+}
+]=])
+    file(GLOB echoes_boost_includes LIST_DIRECTORIES true
+        "${EDEN_CPM_CACHE}/boost/*/libs/*/include")
+    dsmod_add_test(dsmod-echoes-assets KEEP_ASSERTS
+        SOURCES echoes_assets_test.cpp echoes_assets.cpp ${ECHOES_TEXTURE_SOURCES}
+            "${EDEN_SOURCE_ROOT}/src/video_core/textures/astc.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder"
+            ${echoes_boost_includes}
+        COMPILE_DEFINITIONS ECHOES_TEST_NATIVE_ASTC=1)
+    dsmod_add_test(dsmod-echoes-map-assets KEEP_ASSERTS
+        SOURCES echoes_map_assets_test.cpp echoes_map_assets.cpp echoes_assets.cpp ${ECHOES_TEXTURE_SOURCES}
+            "${EDEN_SOURCE_ROOT}/src/video_core/textures/astc.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder"
+            ${echoes_boost_includes}
+        COMPILE_DEFINITIONS ECHOES_TEST_NATIVE_ASTC=1)
+    dsmod_add_test(dsmod-echoes-map-icon-assets KEEP_ASSERTS
+        SOURCES echoes_map_icon_assets_test.cpp echoes_map_icon_assets.cpp ${ECHOES_TEXTURE_SOURCES}
+            "${EDEN_SOURCE_ROOT}/src/video_core/textures/astc.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder" ${echoes_boost_includes}
+        COMPILE_DEFINITIONS ECHOES_TEST_NATIVE_ASTC=1)
+    target_include_directories(dsmod-echoes-map-icon-assets-test BEFORE PRIVATE "${echoes_shim_dir}")
+    target_include_directories(dsmod-echoes-map-assets-test BEFORE PRIVATE "${echoes_shim_dir}")
+    set(ECHOES_TEST_ROMFS "" CACHE PATH "Optional local Echoes native RomFS test fixture")
+    set_tests_properties(dsmod-echoes-map-assets PROPERTIES SKIP_RETURN_CODE 77)
+    if(ECHOES_TEST_ROMFS)
+        set_tests_properties(dsmod-echoes-map-assets PROPERTIES
+            ENVIRONMENT "ECHOES_ROMFS=${ECHOES_TEST_ROMFS}")
+    endif()
+    dsmod_add_test(dsmod-echoes-dungeon-assets KEEP_ASSERTS
+        SOURCES echoes_dungeon_assets_test.cpp echoes_dungeon_assets.cpp echoes_dungeon.cpp ${ECHOES_TEXTURE_SOURCES}
+            "${EDEN_SOURCE_ROOT}/src/video_core/textures/astc.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder"
+            ${echoes_boost_includes}
+        COMPILE_DEFINITIONS ECHOES_TEST_NATIVE_ASTC=1)
+    target_include_directories(dsmod-echoes-dungeon-assets-test BEFORE PRIVATE "${echoes_shim_dir}")
+    set_tests_properties(dsmod-echoes-dungeon-assets PROPERTIES SKIP_RETURN_CODE 77)
+    target_include_directories(dsmod-echoes-assets-test BEFORE PRIVATE "${echoes_shim_dir}")
+endif()
+set_source_files_properties(echoes_fonts.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+
+if(BUILD_TESTING AND NOT ANDROID)
+    dsmod_add_test(dsmod-wonder-catalog KEEP_ASSERTS
+        SOURCES wonder_catalog_test.cpp ${WONDER_ASSET_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_NLOHMANN_JSON_INCLUDE_DIR}"
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder" "${WONDER_ZSTD_LIB}")
+    dsmod_add_test(dsmod-p5r-reader
+        SOURCES 01005CA01580E000_test.cpp ${P5R_READER_SOURCES} p5r_romfs_assets.cpp)
+    # Needs the player's romfs (P5R_ROMFS); exits 77 (skipped) without one.
+    set_tests_properties(dsmod-p5r-reader PROPERTIES SKIP_RETURN_CODE 77)
+    dsmod_add_test(dsmod-p5r-assets
+        SOURCES p5r_romfs_assets_test.cpp p5r_romfs_assets.cpp p5r_romfs_assets.h
+            p5r_romfs_local.h
+        COMPILE_OPTIONS -Wall -Wextra)
+    dsmod_add_test(dsmod-p5r-dwrite
+        SOURCES p5r_direct_write_test.cpp p5r_direct_write.h
+        COMPILE_OPTIONS -Wall -Wextra)
+    dsmod_add_test(dsmod-p5r-recipes
+        SOURCES p5r_recipes_test.cpp p5r_recipes.h p5r_romfs_assets.cpp
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/stb"
+        COMPILE_OPTIONS -O2)
+    dsmod_add_test(dsmod-p5r-font SOURCES p5r_font_test.cpp p5r_font.h)
+    dsmod_add_test(dsmod-p5r-map-overlay SOURCES p5r_map_overlay_test.cpp p5r_map_overlay.h)
+    dsmod_add_test(dsmod-p5r-dialogue
+        SOURCES p5r_dialogue_reader_test.cpp
+        COMPILE_OPTIONS -Wall -Wextra)
+    dsmod_add_test(dsmod-dread KEEP_ASSERTS
+        SOURCES 010093801237C000_test.cpp 010093801237C000.cpp 010093801237C000_testing.h
+            "${EDEN_SOURCE_ROOT}/src/core/mods/dsmod_module_abi.h" ${DREAD_ROMFS_SOURCES} ${DREAD_MAPGEN_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_FMT_INCLUDE_DIR}" "${EDEN_NLOHMANN_JSON_INCLUDE_DIR}"
+        COMPILE_DEFINITIONS DSMOD_DREAD_TESTING=1 FMT_HEADER_ONLY=1)
+    dsmod_add_test(dsmod-dread-rfl
+        SOURCES dread_rfl_test.cpp ${DREAD_ROMFS_SOURCES}
+        COMPILE_OPTIONS -Wall -Wextra)
+    dsmod_add_test(dsmod-dread-mapgen
+        SOURCES dread_mapgen_test.cpp ${DREAD_ROMFS_SOURCES} ${DREAD_MAPGEN_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_NLOHMANN_JSON_INCLUDE_DIR}"
+        COMPILE_OPTIONS -Wall -Wextra)
+    dsmod_add_test(dsmod-mk8d-reader KEEP_ASSERTS
+        SOURCES 0100152000022000_test.cpp ${MK8D_MODULE_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    # CTR_ROMFS=<dir with archives/*.pak> enables the romfs checks; without it only LZMA runs.
+    dsmod_add_test(dsmod-ctr-assets KEEP_ASSERTS
+        SOURCES 0100F9F00C696000_test.cpp ${CTR_ASSET_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-ctr-reader KEEP_ASSERTS
+        SOURCES ctr_reader_test.cpp ctr_reader.cpp ${CTR_ASSET_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    # the console-check diagnostics build (CTR_DSMOD_DIAGNOSTICS) must keep compiling
+    dsmod_add_test(dsmod-ctr-reader-diag KEEP_ASSERTS
+        SOURCES ctr_reader_test.cpp ctr_reader.cpp ${CTR_ASSET_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder"
+        COMPILE_DEFINITIONS CTR_DSMOD_DIAGNOSTICS=1)
+    dsmod_add_test(dsmod-mk8d-anim KEEP_ASSERTS
+        SOURCES mk8d_anim_test.cpp ${MK8D_ANIM_SOURCES})
+    # Synthetic checks always; the real-data checks run when MK8D_ROMFS names your own 4.0.0
+    # romfs dump (environment, or this cache variable for ctest) and, for the CTGP-DX course
+    # files, when MK8D_CTGP_ROMFS (environment) names the plugin's romfs. MK8D_CONTACT_DIR (same
+    # two routes as MK8D_ROMFS) writes contact-sheet PNGs for local visual review; they are never
+    # packaged.
+    dsmod_add_test(dsmod-mk8d-assets KEEP_ASSERTS
+        SOURCES mk8d_assets_test.cpp ${MK8D_ASSET_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    set(MK8D_ROMFS "" CACHE PATH "Local MK8D 4.0.0 romfs dump for dsmod-mk8d-assets (optional)")
+    set(MK8D_CONTACT_DIR "" CACHE PATH "Where dsmod-mk8d-assets writes contact sheets (optional)")
+    set(mk8d_test_env)
+    if(MK8D_ROMFS)
+        list(APPEND mk8d_test_env "MK8D_ROMFS=${MK8D_ROMFS}")
+    endif()
+    if(MK8D_CONTACT_DIR)
+        list(APPEND mk8d_test_env "MK8D_CONTACT_DIR=${MK8D_CONTACT_DIR}")
+    endif()
+    if(mk8d_test_env)
+        set_tests_properties(dsmod-mk8d-assets PROPERTIES ENVIRONMENT "${mk8d_test_env}")
+    endif()
+endif()
+
+# Separate installable companions; these targets are excluded from the APK build.
+file(GLOB ACNH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/acnh_*.cpp")
+list(FILTER ACNH_SOURCES EXCLUDE REGEX "_test\\.cpp$")
+set(ACNH_THIRD_PARTY_SOURCES
+    third_party/stb_truetype.h
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+    ${WONDER_ZSTD_SOURCES})
+set(ACNH_INCLUDE_DIRECTORIES
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder" "${EDEN_SOURCE_ROOT}/externals/stb" "${WONDER_ZSTD_LIB}")
+# The art recipes reproduce the research composer's float32 arithmetic exactly (tests compare
+# pixels): no fused multiply-add contraction on AArch64.
+set_source_files_properties(acnh_draw.cpp acnh_lyt.cpp acnh_ui_bg.cpp acnh_ui_pages.cpp
+    PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+option(EDEN_ACNH_BUILD_DIAGNOSTICS "Include ACNH local diagnostics and profiling" OFF)
+dsmod_add_module(dsmod-acnh EXCLUDE_FROM_ALL
+    TITLE 01006F8002326000
+    SOURCES 01006F8002326000.cpp ${ACNH_SOURCES} ${ACNH_THIRD_PARTY_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+        eden_dsmod_get_data_extensions eden_dsmod_get_write_extensions
+    INCLUDE_DIRECTORIES ${ACNH_INCLUDE_DIRECTORIES}
+    COMPILE_DEFINITIONS EDEN_ACNH_DIAGNOSTICS=$<BOOL:${EDEN_ACNH_BUILD_DIAGNOSTICS}>)
+# Keep private checkout locations out of released binaries and reproducible diagnostics.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(dsmod-acnh PRIVATE "-ffile-prefix-map=${EDEN_SOURCE_ROOT}=."
+        "-ffile-prefix-map=${CMAKE_CURRENT_LIST_DIR}=native/modules")
+endif()
+
+
+set(FE3H_ASSET_SOURCES
+    fe3h_romfs.cpp
+    fe3h_romfs.h
+    fe3h_g1t.cpp
+    fe3h_g1t.h
+    fe3h_assets.cpp
+    fe3h_assets.h
+    fe3h_font.cpp
+    fe3h_font.h
+    fe3h_text.cpp
+    fe3h_text.h
+    fe3h_ui2d.cpp
+    fe3h_ui2d.h
+    dread_mapgen_util.cpp
+    dread_mapgen_util.h
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp")
+set(FE3H_READER_SOURCES
+    fe3h_reader.cpp
+    fe3h_reader.h
+    fe3h_reader_internal.h
+    fe3h_reader_academy.cpp
+    fe3h_reader_battle.cpp
+    fe3h_reader_calendar.cpp
+    fe3h_reader_details.cpp
+    fe3h_reader_header.cpp
+    fe3h_reader_monastery.cpp
+    fe3h_reader_quests.cpp
+    fe3h_reader_resolve.cpp
+    fe3h_reader_rules.cpp
+    fe3h_pins.inc)
+set(FE3H_MODULE_SOURCES
+    010055D009F78000.cpp
+    ${FE3H_READER_SOURCES}
+    ${FE3H_ASSET_SOURCES})
+dsmod_add_module(dsmod-fe3h EXCLUDE_FROM_ALL
+    TITLE 010055D009F78000
+    SOURCES ${FE3H_MODULE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+
+
+set(ISAAC_ASSET_SOURCES
+    isaac_text.cpp
+    isaac_text.h
+    isaac_assets.cpp
+    isaac_assets.h
+    isaac_assets_xml.h
+    isaac_romfs.cpp
+    isaac_romfs.h
+    isaac_pcx.cpp
+    isaac_pcx.h
+    isaac_anm2.cpp
+    isaac_anm2.h
+    isaac_font.cpp
+    isaac_font.h
+    isaac_map.cpp
+    isaac_map.h)
+set(ISAAC_MODULE_SOURCES
+    010021C000B6A000.cpp
+    isaac_reader.cpp
+    isaac_reader.h
+    isaac_pins.inc
+    isaac_afterbirth.inc
+    isaac_mapreg.h
+    ${ISAAC_ASSET_SOURCES})
+dsmod_add_module(dsmod-isaac EXCLUDE_FROM_ALL
+    TITLE 010021C000B6A000
+    SOURCES ${ISAAC_MODULE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions)
+
+# Isaac regressions: compiled animation coordinates and memory-reader pickup selection.
+if(BUILD_TESTING AND NOT ANDROID)
+    dsmod_add_test(dsmod-isaac-anm2 KEEP_ASSERTS
+        SOURCES isaac_anm2_test.cpp isaac_anm2.cpp isaac_map.cpp isaac_pcx.cpp)
+    dsmod_add_test(dsmod-isaac-reader KEEP_ASSERTS
+        SOURCES isaac_reader_test.cpp isaac_reader.cpp ${ISAAC_ASSET_SOURCES})
+    # Integration fixtures from your own game files (defaults: the configure environment).
+    # Without them the test fails, unless ISAAC_FIXTURES_OPTIONAL reports it as Skipped.
+    set(ISAAC_ABP_IMAGE "$ENV{ISAAC_ABP_IMAGE}" CACHE FILEPATH "AfterbirthPlus.nro (Isaac test fixture)")
+    set(ISAAC_REP_IMAGE "$ENV{ISAAC_REP_IMAGE}" CACHE FILEPATH "Repentance.nro (Isaac test fixture)")
+    set(ISAAC_ROMFS "$ENV{ISAAC_ROMFS}" CACHE PATH "Merged Isaac program romfs (Isaac test fixture)")
+    set(ISAAC_FILE "$ENV{ISAAC_FILE}" CACHE PATH "Isaac package dir with eid_*.dat (Isaac test fixture)")
+    option(ISAAC_FIXTURES_OPTIONAL "Report missing Isaac reader fixtures as Skipped, not failed" OFF)
+    set(isaac_fixture_env)
+    foreach(var ISAAC_ABP_IMAGE ISAAC_REP_IMAGE ISAAC_ROMFS ISAAC_FILE)
+        if(${var})
+            list(APPEND isaac_fixture_env "${var}=${${var}}")
+        endif()
+    endforeach()
+    if(ISAAC_FIXTURES_OPTIONAL)
+        list(APPEND isaac_fixture_env "ISAAC_ALLOW_MISSING_FIXTURES=1")
+    endif()
+    set_tests_properties(dsmod-isaac-reader PROPERTIES SKIP_RETURN_CODE 77)
+    if(isaac_fixture_env)
+        set_tests_properties(dsmod-isaac-reader PROPERTIES ENVIRONMENT "${isaac_fixture_env}")
+    endif()
+endif()
+
+# Dragon Quest III HD-2D Remake 1.1.0.0: read-only field party reader with code-pinned routes;
+# art and font decoded at runtime from the player's own Nicola-Switch.pak (pinned members,
+# hash-checked, Oodle via the vendored ooz in third_party/ooz, GPLv3+), BC7 and stb_truetype.
+set(DQ3_OOZ_SOURCES
+    third_party/ooz/kraken.cpp
+    third_party/ooz/lzna.cpp
+    third_party/ooz/bitknit.cpp
+    third_party/ooz/oozlib.cpp
+    third_party/ooz/ooz.h
+    third_party/ooz/ooz_simd.h
+    third_party/ooz/stdafx.h)
+# ooz type-puns through pointer casts; its upstream code is kept as is (warnings off). Its LZ
+# copies read 8-byte words that overlap the bytes they write (delta literals at a small negative
+# last offset); GCC's vectorizer at -O3 reorders those and decodes wrongly (found by the
+# decoded-hash check on the B8G8R8A8 sprite atlases), so vectorization is off for these files.
+# GCC's -fno-tree-vectorize turns off both the loop and the SLP vectorizer; in Clang (Android NDK)
+# it only aliases -fno-vectorize, so Clang also gets -fno-slp-vectorize.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(DQ3_OOZ_NOVEC "-fno-vectorize;-fno-slp-vectorize")
+else()
+    set(DQ3_OOZ_NOVEC "-fno-tree-vectorize")
+endif()
+set_source_files_properties(third_party/ooz/kraken.cpp third_party/ooz/lzna.cpp
+    third_party/ooz/bitknit.cpp third_party/ooz/oozlib.cpp
+    PROPERTIES COMPILE_OPTIONS "-fno-strict-aliasing;${DQ3_OOZ_NOVEC};-w")
+set(DQ3_CORE_SOURCES
+    dq3_pak.cpp
+    dq3_pak.h
+    dq3_art.cpp
+    dq3_art.h
+    dq3_font.cpp
+    dq3_font.h
+    dq3_reader.cpp
+    dq3_reader.h
+    dq3_sprites.cpp
+    dq3_sprites.h
+    dq3_sprite_pins.inc
+    dq3_battle.cpp
+    dq3_battle.h
+    dq3_battle_art.cpp
+    dq3_battle_art.h
+    dq3_battle_pins.inc
+    dq3_element_art.cpp
+    dq3_element_art.h
+    dq3_element_pins.inc
+    dq3_battle_view.cpp
+    dq3_battle_view.h
+    dq3_cooked.h
+    dq3_tables.cpp
+    dq3_tables.h
+    dq3_map.cpp
+    dq3_map.h
+    dq3_map_pins.inc
+    dq3_map_swap.h
+    dq3_info.cpp
+    dq3_info.h
+    dq3_info_pins.inc
+    dq3_info_view.cpp
+    dq3_info_view.h
+    dq3_system.cpp
+    dq3_system.h
+    dq3_system_pins.inc
+    dq3_heal.h
+    dq3_keys.h
+    dq3_layout.h
+    dq3_page_layout.h
+    third_party/stb_truetype.h
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+    ${DQ3_OOZ_SOURCES})
+dsmod_add_module(dsmod-dq3 EXCLUDE_FROM_ALL
+    TITLE 01003E601E324000
+    SOURCES 01003E601E324000.cpp ${DQ3_CORE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+if(BUILD_TESTING AND NOT ANDROID)
+    # Synthetic checks always; DQ3_PAK (environment) = your own merged Nicola-Switch.pak adds the
+    # real-archive checks (every pinned member, textures, font atlas, composed art).
+    # DQ3_TEST_API: the test-only entry points (ReadBags, GameTextMetrics, ...), left out of the module.
+    dsmod_add_test(dsmod-dq3 KEEP_ASSERTS
+        SOURCES 01003E601E324000_test.cpp ${DQ3_CORE_SOURCES}
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder"
+        COMPILE_DEFINITIONS DQ3_TEST_API=1)
+endif()
+
+# Pokémon Brilliant Diamond/Shining Pearl 1.3.0 + Luminescent Platinum 2.2F: live party/battle reader
+# (lp_live), battle-menu drive and art/text/data decoded from the player's romfs through the
+# Unity asset reader (lp_unity, from lp.cmake).
+include("${CMAKE_CURRENT_LIST_DIR}/lp.cmake")
+
+# Fire Emblem Engage 2.0.0 (0100A6301214E000): read-only IL2CPP live reader (scene flags,
+# MapSituation, UnitPool force rosters, MapImage grid/terrain + the game-computed danger bitmap)
+# and content-keyed war-map images (fee_map), plus the game's own message tables and face
+# thumbnails decoded from the player's romfs (fee_text, fee_assets through lp_unity).
+set(FEE_MODULE_SOURCES
+    0100A6301214E000.cpp
+    fee_reader.cpp
+    fee_reader.h
+    fee_pins.inc
+    fee_map.cpp
+    fee_map.h
+    fee_text.cpp
+    fee_text.h
+    fee_assets.cpp
+    fee_assets.h
+    fee_font.cpp
+    fee_font.h
+    fee_sprites.cpp
+    fee_sprites.h
+    fee_hud.cpp
+    fee_hud.h
+    fee_hub.cpp
+    fee_hub.h
+    fee_guest.h
+    ${LP_UNITY_SOURCES})
+dsmod_add_module(dsmod-fee EXCLUDE_FROM_ALL
+    TITLE 0100A6301214E000
+    SOURCES ${FEE_MODULE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+    INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES})
+
+if(BUILD_TESTING AND NOT ANDROID)
+    # Synthetic MSBT/table joins plus the reader's pure helpers; needs no game data.
+    dsmod_add_test(dsmod-fee-reader KEEP_ASSERTS
+        SOURCES fee_reader_test.cpp fee_reader.cpp fee_reader.h fee_pins.inc fee_map.cpp fee_map.h
+            fee_text.cpp fee_text.h fee_assets.cpp fee_assets.h fee_font.cpp fee_font.h fee_sprites.cpp fee_sprites.h ${LP_UNITY_SOURCES}
+        INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES}
+        COMPILE_OPTIONS -Wall -Wextra)
+    # Pure key-grammar/dispatch checks for fee_sprites (P0-3 native art), no game data needed.
+    dsmod_add_test(dsmod-fee-sprites KEEP_ASSERTS
+        SOURCES fee_sprites_test.cpp fee_sprites.cpp fee_sprites.h ${LP_UNITY_SOURCES}
+        INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES}
+        COMPILE_OPTIONS -Wall -Wextra)
+    # D2 war-map compositor: synthetic Ch.10-like frame, Hash/Geometry contract + Render pixel
+    # spot checks; dumps a few PNGs for a visual compare against the D2 raw crops.
+    dsmod_add_test(dsmod-fee-map KEEP_ASSERTS
+        SOURCES fee_map_test.cpp fee_map.cpp fee_map.h
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/stb"
+        COMPILE_OPTIONS -Wall -Wextra)
+    # Somniel/world-map/roster reader (fee_hub.cpp): synthetic HubSequence/GmapSequence +
+    # UnitPool force-0 roster, scene-mode gating and the roster_pick action.
+    dsmod_add_test(dsmod-fee-hub KEEP_ASSERTS
+        SOURCES fee_hub_test.cpp fee_hub.cpp fee_hub.h fee_text.cpp fee_text.h fee_pins.inc ${LP_UNITY_SOURCES}
+        INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES}
+        COMPILE_OPTIONS -Wall -Wextra)
+    # Native HUD hide (fee_hud.cpp): fake mailbox + simulated guest stub, hide/restore plans.
+    dsmod_add_test(dsmod-fee-hud KEEP_ASSERTS
+        SOURCES fee_hud_test.cpp fee_hud.cpp fee_hud.h
+        COMPILE_OPTIONS -Wall -Wextra)
+endif()
+set(LP_MODULE_SOURCES
+    0100000011D90000.cpp
+    lp_live.cpp
+    lp_live.h
+    lp_pk8.h
+    lp_assets.cpp
+    lp_assets.h
+    lp_dex.h
+    lp_dex_text.h
+    lp_poketch.cpp
+    lp_poketch.h
+    lp_raster.h
+    lp_strings.h
+    lp_strings_data.h
+    lp_switch.h
+    ${LP_UNITY_SOURCES})
+dsmod_add_module(dsmod-lp EXCLUDE_FROM_ALL
+    TITLE 0100000011D90000
+    SOURCES ${LP_MODULE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+        eden_dsmod_get_write_extensions
+    INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES})
+# The importer and module ABI bind a package to one title. Keep the implementation shared,
+# but build a separate Pearl library with its own address profile and title identity.
+dsmod_add_module(dsmod-lp-pearl EXCLUDE_FROM_ALL
+    TITLE 010018E011D92000
+    SOURCES ${LP_MODULE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+        eden_dsmod_get_write_extensions
+    INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES}
+    COMPILE_DEFINITIONS LP_PEARL=1)
+option(LP_DEBUG_KEYS "Pokémon companions: also publish the values only the harness and console read" OFF)
+foreach(lp_target IN ITEMS dsmod-lp dsmod-lp-pearl)
+    if(LP_DEBUG_KEYS)
+        target_compile_definitions(${lp_target} PRIVATE LP_DEBUG_KEYS=1)
+    endif()
+    # lp_unity's dev-tool entry points (sprite/texture/font/object listings, raw texture decode,
+    # cache control, ...) serve lp-unity-tool and the tests only: the shipped library drops all
+    # code nothing references.
+    if(NOT MSVC)
+        target_compile_options(${lp_target} PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(${lp_target} PRIVATE "-Wl,--gc-sections")
+    endif()
+endforeach()
+if(BUILD_TESTING AND NOT ANDROID)
+    dsmod_add_test(dsmod-lp-poketch-display KEEP_ASSERTS
+        SOURCES lp_poketch_display_test.cpp lp_poketch_display.h lp_poketch.cpp lp_raster.h
+            ${LP_UNITY_SOURCES}
+        INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES})
+    dsmod_add_test(dsmod-lp-reader KEEP_ASSERTS
+        SOURCES 0100000011D90000_test.cpp lp_dex.h lp_live.cpp lp_live.h lp_pk8.h lp_strings.h lp_strings_data.h lp_switch.h)
+    dsmod_add_test(dsmod-lp-pearl-reader KEEP_ASSERTS
+        SOURCES 0100000011D90000_test.cpp lp_dex.h lp_live.cpp lp_live.h lp_pk8.h lp_strings.h lp_strings_data.h lp_switch.h
+        COMPILE_DEFINITIONS LP_PEARL=1)
+    # The whole module through its C ABI with an empty host (no game memory, no romfs).
+    dsmod_add_test(dsmod-lp-module KEEP_ASSERTS
+        SOURCES lp_module_test.cpp ${LP_MODULE_SOURCES}
+        INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES})
+    dsmod_add_test(dsmod-lp-pearl-module KEEP_ASSERTS
+        SOURCES lp_module_test.cpp ${LP_MODULE_SOURCES}
+        INCLUDE_DIRECTORIES ${LP_UNITY_INCLUDE_DIRECTORIES}
+        COMPILE_DEFINITIONS LP_PEARL=1)
+endif()
+
+# Chained Echoes: Unity asset reader (no module target yet).
+include("${CMAKE_CURRENT_LIST_DIR}/chained_echoes.cmake")
+
+# Yoru Tomosu 1.0.0: read-only native history/unlocks and effective-ROMFS composition.
+dsmod_add_module(dsmod-yoru EXCLUDE_FROM_ALL TITLE 0100C2901153C000
+    SOURCES yoru_module.cpp yoru_reader.cpp yoru_assets.cpp yoru_view.cpp acnh_tex.cpp
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+# Hardening (2026-10-17): never let an absolute path under the build host's home directory
+# survive into DWARF (comp_dir, per-lambda source paths) -- this is what leaked the owner's local
+# username into a shipped .so. Belt-and-suspenders with packaging/yoru-tomosu/rebuild.sh's own
+# llvm-strip step and tools/build_dualscreen_package.py's packaging-time hygiene check.
+target_compile_options(dsmod-yoru PRIVATE "-fdebug-prefix-map=$ENV{HOME}=~")
+if(BUILD_TESTING AND NOT ANDROID)
+    dsmod_add_test(dsmod-yoru-reader KEEP_ASSERTS
+        SOURCES yoru_reader_test.cpp yoru_reader.cpp
+        COMPILE_OPTIONS -Wall -Wextra)
+endif()
+
+
+# Diablo III: Eternal Collection (2.7.7.92380): reader, CPK/texture/font decoders, composed views.
+# Reuses the Dread module's RFC 1951 inflate (dread_mapgen_util.cpp) for the CPK zlib chunks.
+set(D3_MODULE_SOURCES
+    01001B300B9BE000.cpp
+    d3_build.cpp d3_build.h
+    d3_reader.cpp d3_reader.h
+    d3_cpk.cpp d3_cpk.h
+    d3_tex.cpp d3_tex.h
+    d3_font.cpp d3_font.h
+    d3_img.h
+    d3_assets.cpp d3_assets.h
+    d3_view.cpp d3_view.h
+    d3_activities.cpp d3_activities.h
+    d3_hg_mem.cpp d3_hg_mem.h d3_hg_text.cpp d3_hg_text.h d3_hg_draw.h d3_hg_tabs.cpp d3_hg_tabs.h
+    d3_page_hero.cpp d3_page_hero.h d3_page_gear.cpp d3_page_gear.h d3_gear_drive.cpp d3_gear_drive.h
+    d3_skills.cpp d3_skills.h d3_options.cpp d3_options.h
+    dread_mapgen_util.cpp dread_mapgen_util.h
+    "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp")
+dsmod_add_module(dsmod-d3 EXCLUDE_FROM_ALL
+    TITLE 01001B300B9BE000
+    SOURCES ${D3_MODULE_SOURCES}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+target_compile_options(dsmod-d3 PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+set_source_files_properties("${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp" PROPERTIES COMPILE_OPTIONS -w) # upstream file
+if(NOT ANDROID)
+    add_executable(dsmod-d3-tool EXCLUDE_FROM_ALL d3_view_tool.cpp d3_build.cpp d3_cpk.cpp d3_tex.cpp
+        d3_font.cpp d3_assets.cpp d3_view.cpp d3_activities.cpp d3_skills.cpp d3_hg_text.cpp
+        d3_hg_mem.cpp dread_mapgen_util.cpp
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp")
+    target_compile_features(dsmod-d3-tool PRIVATE cxx_std_20)
+    target_include_directories(dsmod-d3-tool PRIVATE "${EDEN_SOURCE_ROOT}/src"
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+endif()
+
+
+# Farming Simulator Nintendo Switch Edition (title 0100D04004176000).
+dsmod_add_module(dsmod-farming-simulator EXCLUDE_FROM_ALL TITLE 0100D04004176000
+    SOURCES 0100D04004176000.cpp ${FARMING_SIMULATOR_SOURCES} ${FARMING_SIMULATOR_READER}
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_write_extensions
+    COMPILE_DEFINITIONS ${FARMING_SIMULATOR_DEFINITIONS})
+if(NOT ANDROID)
+    add_executable(farming-simulator-presentation-check EXCLUDE_FROM_ALL
+        farming_simulator_test.cpp ${FARMING_SIMULATOR_SOURCES})
+    if(BUILD_TESTING)
+        dsmod_add_test(dsmod-farming-simulator-reader KEEP_ASSERTS
+            SOURCES farming_simulator_reader_test.cpp)
+        dsmod_add_test(dsmod-farming-simulator-time-control KEEP_ASSERTS
+            SOURCES farming_simulator_time_control_test.cpp)
+        dsmod_add_test(dsmod-farming-simulator-density KEEP_ASSERTS
+            SOURCES farming_simulator_density_test.cpp)
+        dsmod_add_test(dsmod-farming-simulator-game-calls KEEP_ASSERTS
+            SOURCES farming_simulator_game_calls_test.cpp)
+    endif()
+    target_compile_features(farming-simulator-presentation-check PRIVATE cxx_std_20)
+    target_include_directories(farming-simulator-presentation-check PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}" "${EDEN_SOURCE_ROOT}/src")
+endif()
+
+# VA-11 Hall-A (title 010086500D3C8000): the VAllhalla bartending panel, contributed by Mati.
+include("${CMAKE_CURRENT_LIST_DIR}/va11_hall_a.cmake")
+
+# The Legend of Zelda: Breath of the Wild 1.6.0 (title 01007EF00011E000). One translation unit;
+# the botw_*.h headers are the readers, pages and action bridge. The guest helper that the load
+# plan installs is native/helper/botw/ (rebuilt by tools/botw/build_helper_plan.py).
+dsmod_add_module(dsmod-breath-of-the-wild EXCLUDE_FROM_ALL TITLE 01007EF00011E000
+    SOURCES 01007EF00011E000.cpp
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions)
+target_compile_options(dsmod-breath-of-the-wild PRIVATE -Wall -Wextra -Werror)
+if(NOT ANDROID AND BUILD_TESTING)
+    # Every botw_*_test.cpp is a standalone executable. A few bridge tests use the real steady
+    # clock for 100-250 ms freshness windows and can fail on a heavily loaded host; rerun them alone.
+    file(GLOB BOTW_TESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/botw_*_test.cpp")
+    foreach(test_source IN LISTS BOTW_TESTS)
+        get_filename_component(test_name "${test_source}" NAME_WE)
+        string(REGEX REPLACE "_test$" "" test_name "${test_name}")
+        string(REPLACE "_" "-" test_name "${test_name}")
+        dsmod_add_test(dsmod-${test_name} KEEP_ASSERTS SOURCES "${test_source}"
+            COMPILE_OPTIONS -Wall -Wextra -Werror)
+    endforeach()
+endif()
+
+# Super Mario Odyssey (title 0100000000010000), game build 1.4.1. One translation unit
+# (0100000000010000.cpp) plus the smo_*.{h,cpp} readers and pages: smo_reader (coins/health via a
+# verified StageScene -> GameDataHolder -> gameData chain), smo_save (a read-only BYML v3 parser
+# for File1.bin, wired through eden_dsmod_get_save_extensions), smo_romfs_tables (kingdom/task/
+# capture tables built from the player's own romfs), smo_map/smo_world (native per-kingdom maps,
+# live player position and touched checkpoints), smo_capture (Stats capture portraits and names),
+# smo_progress (task/achievement readiness), smo_warp (direct checkpoint travel) and smo_hud/
+# smo_ui (HUD visibility and page layout). smo_font.cpp merges six native BFFNTs into one glyph
+# atlas (PACKAGE_FORMAT.md section 3.1 allows only one font/font_atlas pair per manifest), reusing
+# the project's existing BC4/RGBA8 BNTX decoder (bc_decoder, already linked by other modules that
+# decode Switch textures, e.g. dsmod-acnh/dsmod-mk8d above).
+dsmod_add_module(dsmod-smo EXCLUDE_FROM_ALL
+    TITLE 0100000000010000
+    SOURCES 0100000000010000.cpp 0100000000010000.h smo_reader.cpp smo_font.cpp smo_font.h
+        smo_save.cpp smo_save.h smo_map.cpp smo_map.h smo_capture.cpp smo_capture.h smo_progress.cpp smo_world.cpp smo_ui.cpp smo_hud.cpp smo_warp.cpp fe3h_ui2d.cpp
+        smo_romfs_tables.cpp smo_romfs_tables.h
+        "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+    EXPORTS eden_dsmod_get_module eden_dsmod_get_extensions eden_dsmod_get_font_extensions
+        eden_dsmod_get_save_extensions eden_dsmod_get_write_extensions
+    INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+set_source_files_properties("${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp" PROPERTIES COMPILE_OPTIONS -w) # upstream file
+if(BUILD_TESTING AND NOT ANDROID)
+    dsmod_add_test(dsmod-smo-reader KEEP_ASSERTS
+        SOURCES 0100000000010000_test.cpp smo_reader.cpp)
+    dsmod_add_test(dsmod-smo-font KEEP_ASSERTS
+        SOURCES smo_font_test.cpp smo_font.cpp "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    set_source_files_properties("${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp" PROPERTIES COMPILE_OPTIONS -w)
+    dsmod_add_test(dsmod-smo-save KEEP_ASSERTS
+        SOURCES smo_save_test.cpp smo_save.cpp smo_romfs_tables.cpp fe3h_ui2d.cpp smo_map.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-smo-romfs-tables KEEP_ASSERTS
+        SOURCES smo_romfs_tables_test.cpp smo_romfs_tables.cpp smo_save.cpp smo_world.cpp fe3h_ui2d.cpp smo_map.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-smo-capture KEEP_ASSERTS
+        SOURCES smo_capture_test.cpp smo_capture.cpp fe3h_ui2d.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-smo-hud KEEP_ASSERTS SOURCES smo_hud_test.cpp smo_hud.cpp)
+    dsmod_add_test(dsmod-smo-warp KEEP_ASSERTS SOURCES smo_warp_test.cpp smo_warp.cpp)
+    dsmod_add_test(dsmod-smo-world-assets KEEP_ASSERTS
+        SOURCES smo_world_assets_test.cpp smo_world.cpp smo_map.cpp smo_save.cpp smo_ui.cpp fe3h_ui2d.cpp smo_romfs_tables.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-smo-progress KEEP_ASSERTS SOURCES smo_progress_test.cpp smo_progress.cpp)
+    dsmod_add_test(dsmod-smo-world KEEP_ASSERTS
+        SOURCES smo_world_test.cpp smo_world.cpp smo_romfs_tables.cpp smo_save.cpp smo_map.cpp fe3h_ui2d.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+    dsmod_add_test(dsmod-smo-map KEEP_ASSERTS
+        SOURCES smo_map_test.cpp smo_map.cpp smo_save.cpp fe3h_ui2d.cpp
+            "${EDEN_SOURCE_ROOT}/externals/bc_decoder/bc_decoder.cpp"
+        INCLUDE_DIRECTORIES "${EDEN_SOURCE_ROOT}/externals/bc_decoder")
+endif()
+
+if(BUILD_TESTING AND NOT ANDROID)
+  add_executable(dsmod-echoes-quick-slots-test echoes_quick_slots_test.cpp)
+  add_test(NAME dsmod-echoes-quick-slots COMMAND dsmod-echoes-quick-slots-test)
+endif()
+
+if(BUILD_TESTING AND NOT ANDROID)
+  add_executable(dsmod-echoes-quick-slot-bridge-test echoes_quick_slot_bridge_test.cpp)
+  add_test(NAME dsmod-echoes-quick-slot-bridge COMMAND dsmod-echoes-quick-slot-bridge-test)
+endif()

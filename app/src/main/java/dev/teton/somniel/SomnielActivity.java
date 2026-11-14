@@ -134,6 +134,8 @@ public class SomnielActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        final String saveMsg = SaveImporter.apply(this); // a save import waiting for this restart: before the game runs
+        DualScreen.installBundled(this); // second-display devices: the bundled companion package, before the game boots
         super.onCreate(savedInstanceState);
         goImmersive();
         showSplash(); // first, so the setup dialog, sidebar and notices all draw above it
@@ -155,18 +157,25 @@ public class SomnielActivity extends SDLActivity {
             @Override public void onInputDeviceRemoved(int id) { updateTouchControls(); }
             @Override public void onInputDeviceChanged(int id) { updateTouchControls(); }
         }, new Handler(Looper.getMainLooper()));
+        dualScreen = new DualScreen(this); // the bottom-screen companion, only when there is a second display and a package
+        dualScreen.start();
         nativeSetMonitorLevel(sidebar.monitorLevel());
         nativeSetFrameRate(sidebar.frameRate());
         nativeSetRenderScale(sidebar.renderScale());
         sidebar.pushGraphics();
 
         getWindow().getDecorView().post(() -> {
+            if (saveMsg != null)
+                new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                        .setTitle("Save import").setMessage(saveMsg).setPositiveButton("OK", null).show();
             // boot notices: the untested-GPU warning first, then the one-time telemetry question
             Runnable ask = () -> {
                 if (telemetry.available() && telemetry.consent() == null) telemetry.showConsent(this::offerCobalt);
                 else { telemetry.start(); offerCobalt(); }
             };
             if (telemetry.untestedGpu()) telemetry.showGpuWarning(ask); else ask.run();
+            // after the other notices have had their moment
+            new Handler(Looper.getMainLooper()).postDelayed(this::autoCheckForUpdates, 8000);
         });
     }
 
@@ -241,7 +250,122 @@ public class SomnielActivity extends SDLActivity {
         });
     }
 
+    private DualScreen dualScreen;
+    DualScreen dualScreen() { return dualScreen; }
+
+    @Override
+    protected void onDestroy() {
+        if (dualScreen != null) dualScreen.stop();
+        super.onDestroy();
+    }
+
     Telemetry telemetry() { return telemetry; }
+
+    // ---- updates (AppUpdater): newest GitHub release ----
+
+    private boolean updateBusy;
+
+    boolean updateCheckEnabled() {
+        return getSharedPreferences("sidebar", MODE_PRIVATE).getBoolean("update_check", true);
+    }
+
+    void setUpdateCheckEnabled(boolean on) {
+        getSharedPreferences("sidebar", MODE_PRIVATE).edit().putBoolean("update_check", on).apply();
+    }
+
+    /** The boot check: at most once every 6 hours, only when the user has not turned it off. */
+    private void autoCheckForUpdates() {
+        if (!updateCheckEnabled() || (setup != null && setup.isShowing())) return;
+        android.content.SharedPreferences p = getSharedPreferences("sidebar", MODE_PRIVATE);
+        long now = System.currentTimeMillis();
+        if (now - p.getLong("update_last", 0) < 6L * 3600 * 1000) return;
+        p.edit().putLong("update_last", now).apply();
+        checkForUpdates(false);
+    }
+
+    /**
+     * Looks for a newer release on GitHub. A manual check says what it found (including "up to date" and errors); the
+     * boot check stays silent unless there is something new. Nothing is downloaded until the user taps Update.
+     */
+    void checkForUpdates(final boolean manual) {
+        if (updateBusy) return;
+        updateBusy = true;
+        if (manual) android.widget.Toast.makeText(this, "Checking for updates...", android.widget.Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            AppUpdater.Release r = null;
+            String error = null;
+            try { r = AppUpdater.fetchLatest(); } catch (Exception e) { error = String.valueOf(e.getMessage()); }
+            final AppUpdater.Release rel = r;
+            final String err = error;
+            runOnUiThread(() -> {
+                updateBusy = false;
+                String cur = BuildVersion.name(this);
+                if (err != null) {
+                    if (manual) android.widget.Toast.makeText(this, "Update check failed: " + err, android.widget.Toast.LENGTH_LONG).show();
+                } else if (!AppUpdater.isNewer(rel.tag, cur)) {
+                    if (manual) android.widget.Toast.makeText(this, "Somniel is up to date (v" + cur + ")", android.widget.Toast.LENGTH_LONG).show();
+                } else if (manual || !rel.tag.equals(getSharedPreferences("sidebar", MODE_PRIVATE).getString("update_skip", ""))) {
+                    offerUpdate(rel, cur, manual);
+                }
+            });
+        }, "update-check").start();
+    }
+
+    private void offerUpdate(final AppUpdater.Release rel, String cur, boolean manual) {
+        String notes = rel.notes == null ? "" : rel.notes.trim();
+        if (notes.length() > 700) notes = notes.substring(0, 700).trim() + "...";
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Update available: " + rel.tag)
+                .setMessage("You have v" + cur + ". Your game data and saves are kept.\n\n" + notes)
+                .setPositiveButton("Update now", (d, w) -> startUpdate(rel))
+                .setNegativeButton("Later", null);
+        if (!manual) b.setNeutralButton("Skip this version",
+                (d, w) -> getSharedPreferences("sidebar", MODE_PRIVATE).edit().putString("update_skip", rel.tag).apply());
+        b.show();
+    }
+
+    private void startUpdate(final AppUpdater.Release rel) {
+        if (!AppUpdater.canInstall(this)) {
+            new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Allow Somniel to install updates")
+                    .setMessage("Android needs your permission once: turn on \"Allow from this source\" for Somniel on the "
+                            + "next screen, come back, and choose Update again.")
+                    .setPositiveButton("Open settings", (d, w) -> AppUpdater.openInstallSettings(this))
+                    .setNegativeButton("Cancel", null)
+                    .show();
+            return;
+        }
+        if (updateBusy) return;
+        updateBusy = true;
+        final android.widget.TextView msg = new android.widget.TextView(this);
+        msg.setPadding(48, 32, 48, 16);
+        msg.setText("Downloading " + rel.tag + "...");
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Updating Somniel").setView(msg).setCancelable(false).create();
+        dlg.show();
+        new Thread(() -> {
+            String error = null;
+            try {
+                java.io.File apk = AppUpdater.download(this, rel, m -> runOnUiThread(() -> msg.setText(m)));
+                runOnUiThread(() -> msg.setText("Installing " + rel.tag + "... Somniel closes when it is done; start it again."));
+                AppUpdater.install(this, apk, err -> runOnUiThread(() -> {
+                    updateBusy = false;
+                    dlg.dismiss();
+                    if (err != null) android.widget.Toast.makeText(this, "Update failed: " + err, android.widget.Toast.LENGTH_LONG).show();
+                }));
+            } catch (Exception e) {
+                error = String.valueOf(e.getMessage());
+            }
+            if (error != null) {
+                final String er = error;
+                runOnUiThread(() -> {
+                    updateBusy = false;
+                    dlg.dismiss();
+                    android.widget.Toast.makeText(this, "Update failed: " + er, android.widget.Toast.LENGTH_LONG).show();
+                });
+            }
+        }, "update-install").start();
+    }
 
     @Override
     protected void onPause() {
@@ -295,6 +419,16 @@ public class SomnielActivity extends SDLActivity {
     private static final int REQ_IMPORT_DRIVER = 0x5D01;
     private static final int REQ_IMPORT_MOD = 0x5D02;
     private static final int REQ_IMPORT_COBALT = 0x5D03;
+    private static final int REQ_IMPORT_SAVES = 0x5D04;
+
+    /** Opens the system file picker for saves: one .zip, or the save files themselves (several at once). */
+    void pickSaves() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        startActivityForResult(i, REQ_IMPORT_SAVES);
+    }
 
     /** Opens the system file picker for a mod archive (.zip or .7z). */
     void pickModArchive() {
@@ -351,6 +485,15 @@ public class SomnielActivity extends SDLActivity {
         if (req == REQ_IMPORT_COBALT) {
             if (res == RESULT_OK && data != null && data.getData() != null && sidebar != null)
                 sidebar.importCobalt(data.getData());
+            return;
+        }
+        if (req == REQ_IMPORT_SAVES) {
+            if (res != RESULT_OK || data == null || sidebar == null) return;
+            java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
+            if (data.getClipData() != null)
+                for (int k = 0; k < data.getClipData().getItemCount(); k++) uris.add(data.getClipData().getItemAt(k).getUri());
+            else if (data.getData() != null) uris.add(data.getData());
+            if (!uris.isEmpty()) sidebar.importSaves(uris);
             return;
         }
         if (req == REQ_IMPORT_DRIVER) {

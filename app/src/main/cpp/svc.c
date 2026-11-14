@@ -163,6 +163,7 @@ static uint32_t svc_set_heap_size(GuestCtx *c) {
             return RES_OUT_OF_MEMORY;
         }
     } else if (size < g_heap_size) {
+        guest_map_bump();
         munmap((void *)(HEAP_BASE + size), g_heap_size - size);
         ftruncate(g_heap_fd, (off_t)size);
     }
@@ -178,6 +179,7 @@ static int in_heap(uint64_t a, uint64_t n) { return a >= HEAP_BASE && a + n <= H
 static int backing_of(uint64_t src, uint64_t size, int *fd, off_t *off);
 
 static uint32_t svc_map_memory(GuestCtx *c) {
+    guest_map_bump();
     uint64_t dst = c->x[0], src = c->x[1], size = c->x[2];
     int fd;
     off_t off;
@@ -193,6 +195,7 @@ static uint32_t svc_map_memory(GuestCtx *c) {
 }
 
 static uint32_t svc_unmap_memory(GuestCtx *c) {
+    guest_map_bump();
     uint64_t dst = c->x[0], src = c->x[1], size = c->x[2];
     int fd;
     off_t off;
@@ -209,9 +212,112 @@ static int g_alias_fd = -1;
 static pthread_mutex_t g_alias_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static inline int alias_get(uint64_t p) { return (g_alias_bits[p >> 3] >> (p & 7)) & 1; }
-static inline void alias_set(uint64_t p, int v) {
-    if (v) g_alias_bits[p >> 3] |= (uint8_t)(1u << (p & 7));
-    else g_alias_bits[p >> 3] &= (uint8_t)~(1u << (p & 7));
+
+/* The bitmap is scanned and written a 64-bit word at a time: a QueryMemory on a large free stretch of the 64 GiB region
+ * used to walk up to 16 million pages one bit at a time under the lock (16 to 60 ms, stalling every MapPhysicalMemory
+ * behind it; the combat-start hitches on the AYN Thor). */
+static uint64_t alias_next_diff(uint64_t p, uint64_t end, int v) { /* first page in [p, end) whose state is not v, else end */
+    const uint64_t *w = (const uint64_t *)g_alias_bits;
+    while (p < end) {
+        uint64_t wi = p >> 6, x = w[wi];
+        if (v) x = ~x;
+        x >>= (p & 63);
+        if (x) {
+            uint64_t r = p + (uint64_t)__builtin_ctzll(x);
+            return r < end ? r : end;
+        }
+        p = (wi + 1) << 6;
+    }
+    return end;
+}
+
+static uint64_t alias_run_start(uint64_t p, int v) { /* first page of the run of state v that ends at page p (inclusive) */
+    const uint64_t *w = (const uint64_t *)g_alias_bits;
+    uint64_t i = p; /* pages below i are still to examine */
+    while (i > 0) {
+        uint64_t wi = (i - 1) >> 6, bit = (i - 1) & 63, x = w[wi];
+        if (v) x = ~x;
+        if (bit != 63) x &= (1ull << (bit + 1)) - 1;
+        if (x) return (wi << 6) + 63 - (uint64_t)__builtin_clzll(x) + 1;
+        i = wi << 6;
+    }
+    return 0;
+}
+
+static void alias_set_range(uint64_t a, uint64_t b, int v) { /* pages [a, b) */
+    uint64_t *w = (uint64_t *)g_alias_bits;
+    while (a < b) {
+        uint64_t bit = a & 63, n = 64 - bit;
+        if (n > b - a) n = b - a;
+        uint64_t mask = (n == 64 ? ~0ull : ((1ull << n) - 1)) << bit;
+        if (v) w[a >> 6] |= mask;
+        else w[a >> 6] &= ~mask;
+        a += n;
+    }
+}
+
+/* Freeing the memory behind an unmapped range (the hole punch) costs 50 to 175 ms for a few hundred MB. It runs on a
+ * helper thread; the pages are already unmapped, and a MapPhysicalMemory over a range still being punched waits for it
+ * (the kernel hands out zeroed pages, so a late punch must never hit a remapped range). */
+#define PUNCH_MAX 64
+typedef struct { uint64_t off, len; int inflight; } Punch;
+static Punch g_pq[PUNCH_MAX];
+static int g_npq, g_pq_thread;
+static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pq_work = PTHREAD_COND_INITIALIZER, g_pq_done = PTHREAD_COND_INITIALIZER;
+
+static void *punch_worker(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "alias-punch");
+    pthread_mutex_lock(&g_pq_mu);
+    for (;;) {
+        int k = -1;
+        for (int i = 0; i < g_npq; i++)
+            if (!g_pq[i].inflight) { k = i; break; }
+        if (k < 0) { pthread_cond_wait(&g_pq_work, &g_pq_mu); continue; }
+        g_pq[k].inflight = 1;
+        Punch p = g_pq[k];
+        pthread_mutex_unlock(&g_pq_mu);
+        fallocate(g_alias_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)p.off, (off_t)p.len);
+        pthread_mutex_lock(&g_pq_mu);
+        for (int i = 0; i < g_npq; i++)
+            if (g_pq[i].inflight && g_pq[i].off == p.off && g_pq[i].len == p.len) { g_pq[i] = g_pq[--g_npq]; break; }
+        pthread_cond_broadcast(&g_pq_done);
+    }
+    return NULL;
+}
+
+static void punch_queue(uint64_t off, uint64_t len) {
+    pthread_mutex_lock(&g_pq_mu);
+    if (g_npq == PUNCH_MAX) { /* queue full: do it here */
+        pthread_mutex_unlock(&g_pq_mu);
+        fallocate(g_alias_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off, (off_t)len);
+        return;
+    }
+    if (!g_pq_thread) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, punch_worker, NULL) == 0) pthread_detach(t), g_pq_thread = 1;
+        else {
+            pthread_mutex_unlock(&g_pq_mu);
+            fallocate(g_alias_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off, (off_t)len);
+            return;
+        }
+    }
+    g_pq[g_npq++] = (Punch){off, len, 0};
+    pthread_cond_signal(&g_pq_work);
+    pthread_mutex_unlock(&g_pq_mu);
+}
+
+static void punch_wait(uint64_t off, uint64_t len) { /* until no queued or running punch overlaps [off, off+len) */
+    pthread_mutex_lock(&g_pq_mu);
+    for (;;) {
+        int hit = 0;
+        for (int i = 0; i < g_npq; i++)
+            if (g_pq[i].off < off + len && off < g_pq[i].off + g_pq[i].len) { hit = 1; break; }
+        if (!hit) break;
+        pthread_cond_wait(&g_pq_done, &g_pq_mu);
+    }
+    pthread_mutex_unlock(&g_pq_mu);
 }
 
 /* The run of equal state containing addr, for QueryMemory. Returns 1 when addr is inside the alias region. */
@@ -221,8 +327,8 @@ int alias_run(uint64_t addr, uint64_t *base, uint64_t *size, int *mapped) {
     uint64_t p = (addr - ALIAS_BASE) >> 12, s = p, e = p + 1;
     int v = g_alias_bits ? alias_get(p) : 0;
     if (g_alias_bits) {
-        while (s > 0 && alias_get(s - 1) == v) s--;
-        while (e < ALIAS_PAGES && alias_get(e) == v) e++;
+        s = alias_run_start(p, v);
+        e = alias_next_diff(p + 1, ALIAS_PAGES, v);
     } else {
         s = 0;
         e = ALIAS_PAGES;
@@ -240,6 +346,8 @@ static uint32_t alias_apply(uint64_t addr, uint64_t size, int map) {
     if ((addr & 0xFFF) || !size || (size & 0xFFF) || addr < ALIAS_BASE || addr + size > ALIAS_BASE + ALIAS_SIZE)
         return (addr & 0xFFF) ? RES_INVALID_ADDRESS : RES_INVALID_SIZE;
     uint32_t res = RES_OK;
+    guest_map_bump(); /* the dual-screen host's cached readable regions may include these pages */
+    if (map) punch_wait(addr - ALIAS_BASE, size); /* the pages must be fresh: no punch of this range may still be pending */
     pthread_mutex_lock(&g_alias_lock);
     if (!g_alias_bits) g_alias_bits = calloc(ALIAS_PAGES / 8, 1);
     if (g_alias_fd < 0) {
@@ -253,8 +361,7 @@ static uint32_t alias_apply(uint64_t addr, uint64_t size, int map) {
     uint64_t p0 = (addr - ALIAS_BASE) >> 12, n = size >> 12;
     for (uint64_t i = 0; i < n && res == RES_OK;) {
         int state = alias_get(p0 + i);
-        uint64_t j = i;
-        while (j < n && alias_get(p0 + j) == state) j++;
+        uint64_t j = alias_next_diff(p0 + i, p0 + n, state) - p0;
         if (state != map) { /* a run that needs changing */
             uint64_t a = addr + (i << 12), len = (j - i) << 12;
             void *p;
@@ -262,10 +369,10 @@ static uint32_t alias_apply(uint64_t addr, uint64_t size, int map) {
                 p = mmap((void *)a, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, g_alias_fd, (off_t)(a - ALIAS_BASE));
             } else {
                 p = mmap((void *)a, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
-                fallocate(g_alias_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)(a - ALIAS_BASE), (off_t)len);
+                if ((uint64_t)p == a) punch_queue(a - ALIAS_BASE, len);
             }
             if ((uint64_t)p != a) res = RES_OUT_OF_MEMORY;
-            else for (uint64_t k = i; k < j; k++) alias_set(p0 + k, map);
+            else alias_set_range(p0 + i, p0 + j, map);
         }
         i = j;
     }
@@ -301,6 +408,7 @@ static int prot_from_perm(uint32_t perm) {
 }
 
 static uint32_t svc_map_process_memory(GuestCtx *c) {
+    guest_map_bump();
     uint64_t dst = c->x[0], src = c->x[2], size = c->x[3];
     if (((dst | src | size) & 0xFFF) || !size) return RES_INVALID_ADDRESS;
     MemInfo mi;
@@ -331,6 +439,7 @@ static uint32_t svc_map_process_memory(GuestCtx *c) {
 }
 
 static uint32_t svc_unmap_process_memory(GuestCtx *c) {
+    guest_map_bump();
     uint64_t dst = c->x[0], size = c->x[3];
     mmap((void *)dst, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
     guest_region_clear(dst);
@@ -348,6 +457,7 @@ static uint32_t svc_unmap_process_memory(GuestCtx *c) {
 static uint32_t svc_set_process_permission(GuestCtx *c) {
     uint64_t addr = c->x[1], size = c->x[2];
     if ((addr | size) & 0xFFF) return RES_INVALID_ADDRESS;
+    guest_map_bump();
     if (mprotect((void *)addr, size, prot_from_perm((uint32_t)c->x[3])) != 0) return RES_INVALID_MEMORY;
     return RES_OK;
 }
@@ -582,18 +692,20 @@ static void svc_exec(GuestCtx *c) {
     }
 
     switch (n) {
-    case 0x01: x[0] = svc_set_heap_size(c); return;
+    case 0x01: x[0] = svc_set_heap_size(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
     case 0x02: { /* SetMemoryPermission(addr, size, perm) */
         int prot = 0;
         if (x[2] & PERM_R) prot |= PROT_READ;
         if (x[2] & PERM_W) prot |= PROT_WRITE;
         if (x[2] & PERM_X) prot |= PROT_EXEC;
+        guest_map_bump();
         x[0] = mprotect((void *)x[0], x[1], prot) == 0 ? 0 : RES_INVALID_MEMORY;
+        guest_map_bump();
         return;
     }
     case 0x03: x[0] = 0; return; /* SetMemoryAttribute */
-    case 0x04: x[0] = svc_map_memory(c); return;
-    case 0x05: x[0] = svc_unmap_memory(c); return;
+    case 0x04: x[0] = svc_map_memory(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
+    case 0x05: x[0] = svc_unmap_memory(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
     case 0x06:
         guest_query(x[2], (MemInfo *)x[0]);
         x[0] = 0;
@@ -670,8 +782,8 @@ static void svc_exec(GuestCtx *c) {
     }
     case 0x29: svc_get_info(c); return;
     case 0x2A: case 0x2B: x[0] = 0; return; /* FlushEntireDataCache / FlushDataCache */
-    case 0x2C: x[0] = svc_map_physical(c); return;
-    case 0x2D: x[0] = svc_unmap_physical(c); return;
+    case 0x2C: x[0] = svc_map_physical(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
+    case 0x2D: x[0] = svc_unmap_physical(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
     case 0x32: x[0] = kthread_set_activity((uint32_t)x[0], (uint32_t)x[1]); return;
     case 0x33: x[0] = kthread_get_context((uint32_t)x[1], (void *)x[0]); return;
     case 0x34: x[0] = sync_wait_for_address(x[0], (uint32_t)x[1], (int32_t)x[2], timeout_arg(x[3])); return;
@@ -692,9 +804,9 @@ static void svc_exec(GuestCtx *c) {
         x[1] = h;
         return;
     }
-    case 0x73: x[0] = svc_set_process_permission(c); return;
-    case 0x74: x[0] = svc_map_process_memory(c); return;
-    case 0x75: x[0] = svc_unmap_process_memory(c); return;
+    case 0x73: x[0] = svc_set_process_permission(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
+    case 0x74: x[0] = svc_map_process_memory(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
+    case 0x75: x[0] = svc_unmap_process_memory(c); guest_map_bump(); return; /* after the change too: see g_map_epoch */
     case 0x40: gs_create(c); return;
     case 0x43: x[0] = gs_receive(c); return;
     case 0x21: {

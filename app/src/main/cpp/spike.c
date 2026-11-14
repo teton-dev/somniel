@@ -18,6 +18,13 @@
 #include "nvn/shader_cache.h"
 
 extern const char *som_data_dir(void);
+#ifdef SOM_DSMOD
+int dsmod_apply_plan(const NsoModule *mods, int nmods, uint64_t mailbox_hint);
+void dsmod_start(void);
+#else
+#define dsmod_apply_plan(a, b, c) 0
+#define dsmod_start() ((void)0)
+#endif
 
 #define ISLAND_A   (MODULE_BASE - 0x02000000ull) /* stub islands: before and after the modules (0x6000000 on the Horizon window) */
 #define ISLAND_SZ  0x01000000ull
@@ -147,6 +154,7 @@ int spike_start(const char *exefs) {
         probes_install(mods, nmods, isl, 2, pp);
     }
     game_patches_apply(mods, nmods, isl, 2);
+    dsmod_apply_plan(mods, nmods, island_b + ISLAND_SZ + 0x100000); /* dual-screen companion (dsmod.cpp): plan before the text is sealed */
     cobalt_emulator_patch(mods, nmods);
     island_seal(&isl[0]);
     island_seal(&isl[1]);
@@ -200,6 +208,7 @@ int spike_start(const char *exefs) {
         return -1;
     }
     pthread_detach(t);
+    dsmod_start();
     return 0;
 }
 

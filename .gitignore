@@ -9,3 +9,4 @@ signing/
 scripts/*.png
 # vendored upstream clone, unmodified: see third_party/SDL-VERSION.txt
 third_party/SDL/
+tools/dsui_test/*.exe

@@ -111,7 +111,10 @@ static MemInfo g_regions[MAX_REGIONS];
 static int g_nregions;
 static pthread_mutex_t g_region_lock = PTHREAD_MUTEX_INITIALIZER;
 
+volatile uint64_t g_map_epoch;
+
 void guest_region_set(uint64_t base, uint64_t size, uint32_t type, uint32_t perm) {
+    guest_map_bump();
     pthread_mutex_lock(&g_region_lock);
     int i;
     for (i = 0; i < g_nregions; i++)
@@ -138,6 +141,7 @@ void guest_region_set(uint64_t base, uint64_t size, uint32_t type, uint32_t perm
 }
 
 void guest_region_clear(uint64_t base) {
+    guest_map_bump();
     pthread_mutex_lock(&g_region_lock);
     for (int i = 0; i < g_nregions; i++)
         if (g_regions[i].base == base) {

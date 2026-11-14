@@ -1,0 +1,25 @@
+{
+ "format": 1,
+ "type": "dual-screen-mod",
+ "title_id": "0100A6301214E000",
+ "name": "Fire Emblem Engage dual screen",
+ "version": "1.0.0",
+ "min_runtime": 22,
+ "requires_module": true,
+ "module": {
+  "abi": 1,
+  "build_ids": [
+   "8C08B9719E085F91847B5E0F935D948800000000000000000000000000000000"
+  ],
+  "libraries": {
+   "linux-x86_64": {
+    "path": "modules/linux-x86_64/0100A6301214E000.so",
+    "sha256": "84a75807ecebace0c3df200efaf207e57586c0672020f47a81f50624dd568846"
+   },
+   "android-arm64-v8a": {
+    "path": "modules/android-arm64-v8a/0100A6301214E000.so",
+    "sha256": "53fee00fa68c3d4395a715ecdf24aea3a91f5f41c37436d6160babc57ace3eb7"
+   }
+  }
+ }
+}

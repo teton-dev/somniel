@@ -1,0 +1,4 @@
+astc_decode.c: ASTC LDR decoder (2D), unchanged apart from the include line.
+Source: the engage-pc-recomp clone (Copyright (c) 2026 Valiantsin Dzerakh, MIT; the same project the Somniel notes already credit) runtime/tex_astc.c @ 5e0ce98f120bd669cb79d3b365d0da1d6d54145b,
+which ports LAS Recomp runtime/nvn/astc.c @ da35b83a9611d046a9a681aae668d7085954d37f (Copyright (c) 2026 Peiikai, MIT).
+Matches ARM astcenc's 8-bit decode bit for bit (per the source's own header). Licence: LICENSE-MIT.txt (both notices).

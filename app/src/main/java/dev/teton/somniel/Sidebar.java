@@ -170,6 +170,8 @@ final class Sidebar {
         showDrivers(false);
         showTouch(false);
         showGraphics(false);
+        refreshDual();
+        refreshShare();
         SomnielActivity.nativeSidebarOpen(true);
         root.setVisibility(View.VISIBLE);
         panel.setTranslationX(-px(340));
@@ -263,6 +265,17 @@ final class Sidebar {
 
         mainPage.addView(row("On-screen controls...", v -> showTouch(true)));
 
+        // dual-screen companion: only listed when the device has a second display (refreshed each time the sidebar opens)
+        dualRow = check("Dual-screen companion", true, on -> {
+            if (!dualBusy && act.dualScreen() != null) act.dualScreen().setEnabled(on);
+        });
+        dualNote = text("", 12, false);
+        dualNote.setTextColor(0xFFD2D8E8);
+        dualNote.setPadding(px(20), 0, px(20), px(10));
+        mainPage.addView(dualRow);
+        mainPage.addView(dualNote);
+        refreshDual();
+
         // render scale: 50% to 125% in 5% steps (visual: nothing reads it yet)
         final int steps = (SCALE_MAX - SCALE_MIN) / SCALE_STEP;
         TextView scaleLabel = label("");
@@ -287,14 +300,25 @@ final class Sidebar {
         });
         mainPage.addView(scale, new LinearLayout.LayoutParams(-1, px(40)));
 
-        mainPage.addView(row("Graphics...", v -> showGraphics(true)));
-
         if (act.telemetry() != null && act.telemetry().available()) {
             Telemetry tel = act.telemetry();
-            mainPage.addView(check("Share anonymous performance & crash data", tel.enabled(), on -> tel.setConsent(on)));
+            shareRow = check("Share anonymous performance & crash data", tel.enabled(), on -> { if (!shareBusy) tel.setConsent(on); });
+            mainPage.addView(shareRow);
         }
+        mainPage.addView(row("Graphics...", v -> showGraphics(true)));
         mainPage.addView(row("Mods...", v -> showMods(true)));
         mainPage.addView(row("Drivers...", v -> showDrivers(true)));
+        mainPage.addView(row("Import saves...", v -> new AlertDialog.Builder(act, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Import saves?")
+                .setMessage("Your current saves will be backed up to " + SaveImporter.BACKUP_DIR + " in this device's "
+                        + "storage and removed from Somniel, then replaced by the saves you choose: a .zip, or the save "
+                        + "files themselves (Global, Auto, Manual0, Manual1...; select several at once).\n\n"
+                        + "The game then restarts. Unsaved progress is lost.")
+                .setPositiveButton("Choose...", (d, w) -> act.pickSaves())
+                .setNegativeButton("Cancel", null)
+                .show()));
+        mainPage.addView(row("Check for updates", v -> act.checkForUpdates(true)));
+        mainPage.addView(check("Check for updates at startup", act.updateCheckEnabled(), on -> act.setUpdateCheckEnabled(on)));
         mainPage.addView(row("Quit Game", v -> confirm("Quit the game?",
                 "Unsaved progress is lost.", "Quit", act::quitGame)));
     }
@@ -325,6 +349,37 @@ final class Sidebar {
 
     private LinearLayout modsList;
     private TextView modsStatus, cobaltStatus;
+    private CheckBox shareRow;
+    private boolean shareBusy;
+
+    /** The share-data box follows the saved answer, e.g. the first-launch prompt's Yes (the box is built before it is asked). */
+    private void refreshShare() {
+        if (shareRow == null || act.telemetry() == null) return;
+        shareBusy = true;
+        shareRow.setChecked(act.telemetry().enabled());
+        shareBusy = false;
+    }
+
+    private CheckBox dualRow;
+    private TextView dualNote;
+    private boolean dualBusy;
+
+    /** Shows the dual-screen option only on a device with a second display, and keeps it in step with the saved choice. */
+    private void refreshDual() {
+        DualScreen d = act.dualScreen();
+        boolean has = d != null && d.hasSecondDisplay();
+        int vis = has ? View.VISIBLE : View.GONE;
+        dualRow.setVisibility(vis);
+        dualNote.setVisibility(vis);
+        if (!has) return;
+        dualBusy = true;
+        dualRow.setChecked(d.enabled());
+        dualBusy = false;
+        dualNote.setText(d.hasPackage()
+                ? "Shows the battle map, unit details and rosters on the second screen."
+                : "No companion package is installed for this game.");
+    }
+
     private Button cobaltDownloadBtn;
     private Button modsApply;
     private final java.util.TreeMap<String, Boolean> modsStaged = new java.util.TreeMap<>(); // name -> wanted on
@@ -502,6 +557,55 @@ final class Sidebar {
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Restart", (d, w) -> act.restartGame())
                 .show();
+    }
+
+    /**
+     * Checks and stages the saves chosen in the file picker (SaveImporter), shows what was found, and on Restart marks
+     * them to be applied (backup, then swap) when the game starts again.
+     */
+    void importSaves(final java.util.List<android.net.Uri> uris) {
+        if (importing) return;
+        importing = true;
+        final Toast t = Toast.makeText(act, "Reading the saves...", Toast.LENGTH_SHORT);
+        t.show();
+        new Thread(() -> {
+            SaveImporter.Staged s = null;
+            String err = null;
+            try {
+                s = SaveImporter.stage(act, uris);
+            } catch (Throwable e) {
+                err = e.getMessage() != null ? e.getMessage() : e.toString();
+            }
+            final SaveImporter.Staged got = s;
+            final String why = err;
+            act.runOnUiThread(() -> {
+                importing = false;
+                if (got == null) {
+                    new AlertDialog.Builder(act, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                            .setTitle("Could not import saves").setMessage("Nothing was changed: " + why + ".")
+                            .setPositiveButton("OK", null).show();
+                    return;
+                }
+                StringBuilder names = new StringBuilder();
+                for (String n : got.names) names.append(names.length() > 0 ? ", " : "").append(n);
+                new AlertDialog.Builder(act, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                        .setTitle("Import " + got.names.size() + " save file" + (got.names.size() == 1 ? "" : "s") + "?")
+                        .setMessage(names + "\n\nThe game restarts, backs up your current saves to "
+                                + SaveImporter.BACKUP_DIR + ", removes them and loads these. Unsaved progress is lost.")
+                        .setPositiveButton("Restart", (d, w) -> {
+                            try {
+                                SaveImporter.commit(act);
+                                act.restartGame();
+                            } catch (java.io.IOException e) {
+                                SaveImporter.discard(act);
+                                Toast.makeText(act, "Could not import: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                            }
+                        })
+                        .setNegativeButton("Cancel", (d, w) -> SaveImporter.discard(act))
+                        .setOnCancelListener(d -> SaveImporter.discard(act))
+                        .show();
+            });
+        }).start();
     }
 
     /** Installs a .zip or .7z mod archive chosen in the file picker (ModImporter), then offers the restart. */

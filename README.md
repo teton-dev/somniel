@@ -27,15 +27,20 @@ The first boot takes longer than later ones while the game's shaders are prepare
 
 ## Tested hardware
 
-Somniel has only been tested on a Retroid Pocket 6 and AYN Thor, both 8GB and 12GB models, so it's built against the Snapdragon 8 Gen 2 SOC, where it maintains a relatively stable 60FPS. 
+Somniel is built and tuned on the **Snapdragon 8 Gen 2 (Adreno 740)**, 8 GB and 12 GB models. Results so far:
 
-- **Mali GPUs: early support.** The game runs on a Galaxy A17 (Mali-G68) and a moto g 2025 (Mali-G57), but frame
-  rates are low and bugs are likely. On a Mali GPU Somniel starts in the handheld profile at 30 fps, and the sidebar's
+| Chip (GPU) | Result |
+| --- | --- |
+| Snapdragon 8 Gen 2 (Adreno 740) | The main target: a mostly steady 60 fps. On dual-screen handhelds the second screen shows the dual-screen companion. |
+| Dimensity 7300 (Mali-G615 MC2) | Playable at 30 fps in the handheld profile. The Somniel hub holds 29-30 fps, its shops included, with Hidden object culling (on by default on Mali). |
+| Exynos 1330 (Mali-G68 MP2) | Boots and plays, but 3D scenes run well below 30 fps (about 18 fps at the 3D title menu). |
+| Dimensity 6300 (Mali-G57 MC2) | Boots and plays, at low frame rates. |
+| Xclipse (Samsung Exynos 2x00) | Untested. |
+
+- **Mali GPUs: early support.** On a Mali GPU Somniel starts in the handheld profile at 30 fps, and the sidebar's
   Graphics page has settings that trade picture quality for speed. The first boot shows a notice about this.
-- **Xclipse GPUs are completely untested.** On other non-Adreno devices the app shows a warning on first boot; you can
-  still try, but expect wrong graphics, bad performance, or the game not starting at all.
-- Other Adreno GPUs and other Snapdragon chips are untested. They may work, and reports are welcome.
-- Requires Vulkan 1.1 and Android 13 or newer is recommended.
+- **Other Adreno GPUs and Snapdragon chips are untested.** They may work, and reports are welcome.
+- Requires Vulkan 1.1; Android 13 or newer is recommended.
 
 ---
 
@@ -68,6 +73,11 @@ Somniel has only been tested on a Retroid Pocket 6 and AYN Thor, both 8GB and 12
 - **Experimental Cobalt mod support.** Cobalt is not included with Somniel, but the Mods page can download the latest
   release for you in one tap, and its plugin (`.nro`) loader is implemented natively. See [Mods](#mods).
 - **Custom GPU drivers:** import a driver package.
+- **Dual-screen companion.** On handhelds with a second screen, the bottom screen shows a live touch companion (battle
+  map, unit details and rosters) by igawa6, made for Eden Duo. It is bundled and starts by itself; the sidebar can turn
+  it off.
+- **Save import.** Sidebar, **Import saves...**: pick a `.zip` or the save files themselves (`Global`, `Auto`,
+  `Manual0`...). Your current saves are first backed up to `Documents/Engage-Backup`, then replaced.
 
 ---
 
@@ -161,8 +171,30 @@ folder (`Android/data/dev.teton.somniel/files/`). Screenshots of rendering glitc
 
 ## Credits and licences
 
-Somniel builds on SDL3, volk, libadrenotools, the engage-pc-recomp project's NVN notes (MIT), and works with
-[Cobalt](https://github.com/Raytwo/Cobalt) by Raytwo, which you download separately. The shader translator is derived
-from Ryujinx. The placeholder app icon uses the Fire Emblem series symbol artwork by Toomai Glittershine (SmashWiki) on Alear's blue and
-red. Fire Emblem is a trademark of Nintendo; Somniel is an unofficial fan project and is not affiliated with
-or endorsed by Nintendo or Intelligent Systems.
+Somniel is free software, released under the [GNU General Public License v3.0](LICENSE). Bundled third-party code
+keeps its own licence; the details are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Thanks to the authors of
+the projects Somniel builds on:
+
+- **Dual-screen companion:** the Fire Emblem Engage companion and the Eden Duo module SDK by
+  [igawa6](https://github.com/igawa6) ([eden-duo-companions](https://github.com/igawa6/eden-duo-companions),
+  [Eden Duo](https://github.com/igawa6/eden-duo), GPL-3.0). Bundled unmodified, with the companion's source in
+  `third_party/eden_duo_companions`. Eden Duo is a fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) emulator.
+- **Shader translator:** derived from the shader compiler of [Ryujinx](https://github.com/Ryujinx/Ryujinx) by the
+  Ryujinx Team and contributors (MIT).
+- **NVN notes and ASTC decoding:** [engage-pc-recomp](https://gitlab.com/engage-pc-recomp/engage-pc-recomp) by Valiantsin
+  Dzerakh (MIT), whose ASTC decoder ports LAS Recomp's by Peiikai (MIT).
+- **60 fps:** the frame-rate control follows the community "60 FPS (no Speedup)" patch by systemdev, zeusiota and
+  dogethis ([GameBanana](https://gamebanana.com/mods/432758)).
+- **[SDL3](https://www.libsdl.org/)** by Sam Lantinga and the SDL contributors (zlib).
+- **[volk](https://github.com/zeux/volk)** by Arseny Kapoulkine (MIT).
+- **[libadrenotools](https://github.com/bylaws/libadrenotools)** by Billy Laws (BSD-2-Clause).
+- **[bcdec](https://github.com/iOrange/bcdec)** by Sergii Kudlai (MIT).
+- **Companion build dependencies:** [LZ4](https://github.com/lz4/lz4) by Yann Collet (BSD-2-Clause), `bc_decoder` by
+  the Skyline Team and the SwiftShader authors (MPL-2.0), and [stb_truetype](https://github.com/nothings/stb) by Sean
+  Barrett (MIT or public domain).
+- **Mods:** [Cobalt](https://github.com/Raytwo/Cobalt) by Raytwo, which you download separately.
+- **App icon:** the placeholder icon uses the Fire Emblem series symbol artwork by Toomai Glittershine (SmashWiki) on
+  Alear's blue and red.
+
+Fire Emblem is a trademark of Nintendo; Somniel is an unofficial fan project and is not affiliated with or endorsed by
+Nintendo or Intelligent Systems. Somniel and the companion are not affiliated with or endorsed by the Eden project.

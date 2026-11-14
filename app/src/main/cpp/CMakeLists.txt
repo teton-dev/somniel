@@ -20,6 +20,9 @@ target_include_directories(volk PUBLIC ${TP}/volk)
 target_compile_definitions(volk PUBLIC VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR)
 # every file that uses Vulkan includes <vulkan/vulkan.h> and then "volk.h" (main.c, nvn/vkr.h, overlay.h, gpu_driver.c)
 
+# Dual-screen companion host (dsmod.cpp): Eden Duo's module ABI headers (GPL-3.0-or-later), vendored in
+# third_party/eden_duo (see its README.md).
+set(DSMOD_ABI_DIR ${TP}/eden_duo/src/core/mods)
 add_library(somniel SHARED
     main.c
     overlay.c
@@ -81,3 +84,10 @@ target_link_libraries(somniel PRIVATE SDL3::SDL3 volk adrenotools android log me
 
 
 
+
+if(EXISTS ${DSMOD_ABI_DIR}/dsmod_module_abi.h)
+    target_sources(somniel PRIVATE dsmod.cpp dsui/dsui.cpp dsui/dsraster.cpp ${TP}/astc_decode/astc_decode.c)
+    target_include_directories(somniel PRIVATE ${TP}/astc_decode)
+    target_include_directories(somniel PRIVATE ${DSMOD_ABI_DIR})
+    target_compile_definitions(somniel PRIVATE SOM_DSMOD=1)
+endif()
