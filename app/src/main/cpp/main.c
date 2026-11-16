@@ -746,7 +746,8 @@ static void input_update(void) {
         if (!rx && !ry) rx = c, ry = d;
     }
     {
-        uint64_t tb = g_touch_buttons | g_touch_latch;
+        extern uint64_t movies_skip_buttons(void);
+        uint64_t tb = g_touch_buttons | g_touch_latch | movies_skip_buttons();
         g_touch_latch = g_touch_buttons; /* a tap is kept for the frame it was pressed in */
         buttons |= tb;
         if (!lx && !ly) lx = g_touch_axes[0], ly = g_touch_axes[1];

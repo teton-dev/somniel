@@ -1,4 +1,4 @@
-/* Live game settings: the frame rate (30, 40 or 60) and the render scale, both set from the sidebar and applied at once.
+/* Live game settings: the frame rate (20, 30, 40, 45 or 60) and the render scale, both set from the sidebar and applied at once.
  *
  * Frame rate. Engage was written for 30 fps: its per-frame logic steps by "vsync ticks" of 1/60 s, two ticks a frame.
  * A frame rate F means 60/F ticks per frame (2, 1.5, 1), and everything the game ties to frames has to follow, or the
@@ -7,8 +7,9 @@
  * lists the same sites), made dynamic with host hooks instead of fixed instruction patches:
  *  - GameTime.get_VsyncFixedCount / get_VsyncFixedTime (what most per-frame code reads) return this frame's ticks. A
  *    GameTime.Update hook, once per frame on the main thread, works them out. 40 fps is 1.5 ticks a frame: the count
- *    alternates 1, 2, 1, 2 so game time still advances exactly 60 ticks per second (float readers see the same value).
- *  - QualitySettings.set_vSyncCount stores 2 at 30 fps and 1 otherwise (it also becomes the window's present interval,
+ *    alternates 1, 2, 1, 2 so game time still advances exactly 60 ticks per second (float readers see the same value);
+ *    45 fps is 1.33 (1, 1, 2) and 20 fps is 3.
+ *  - QualitySettings.set_vSyncCount stores 3 at 20 fps, 2 at 30 and 1 otherwise (it also becomes the window's present interval,
  *    which the pacer ignores: the frame period comes from som_target_fps).
  *  - HubPlayerController uses HubUtil's speed, acceleration and turn rate as distances per update: scaled by 30/F for
  *    speed and turn rate, (30/F)^2 for acceleration and deceleration (60 fps: half and a quarter, as the community patch).
@@ -92,6 +93,8 @@ static volatile int g_scale_pct = 100; /* 50..125 in steps of 5 */
 static volatile int g_vsync_ticks = 1; /* ticks of 1/60 s the game advances this frame */
 static volatile int g_scale_seen;      /* SetRenderScale has run once */
 static volatile int g_scale_applied = 100;
+static volatile int g_scale_eff = 100;  /* the scale in use: g_scale_pct lowered by dynamic resolution (dynres_update) */
+static volatile int g_dyn_step;         /* dynamic resolution: steps below the chosen scale, 0..DR_MAX_STEPS */
 static volatile float g_scale_base = 1.0f;
 static uint64_t g_main_base;
 int game_fps60_on;                     /* the hooks are installed: the settings take effect */
@@ -100,7 +103,7 @@ int som_handheld_profile(void);  /* hooks_system.c */
 static volatile int g_fps_from_ui; /* the sidebar has sent its (saved or default) frame rate */
 
 void som_set_frame_rate(int fps) {
-    if (fps != 30 && fps != 40 && fps != 60) return;
+    if (fps != 20 && fps != 30 && fps != 40 && fps != 45 && fps != 60) return;
     g_fps_from_ui = 1;
     if (fps != g_fps) som_log("settings: frame rate %d fps", fps);
     g_fps = fps;
@@ -112,6 +115,8 @@ void som_set_render_scale(int pct) {
     pct = (pct + 2) / 5 * 5;
     if (pct != g_scale_pct) som_log("settings: render scale %d%%", pct);
     g_scale_pct = pct;
+    g_dyn_step = 0; /* dynamic resolution starts again from the chosen scale */
+    g_scale_eff = pct;
 }
 
 /* the frame period the present pacer holds to, in fps (0: the game's own present interval) */
@@ -252,11 +257,11 @@ static void graphics_frame(GuestCtx *c) {
 
 /* Dynamic game speed. The game steps by ticks of 1/60 s per frame; a fixed count per frame means game time runs slow
  * whenever the device cannot hold the chosen frame rate. Instead, the ticks per frame follow the measured frame time
- * (smoothed), from the frame rate's own count (60/F) up to DYN_MAX_TICKS (3 ticks = a 20 fps floor): at 45 fps on a 60
- * fps setting a frame advances 1.33 ticks and the game still runs at normal speed. Below 20 fps it slows down after
+ * (smoothed), from the frame rate's own count (60/F) up to DYN_MAX_TICKS (4 ticks = a 15 fps floor): at 45 fps on a 60
+ * fps setting a frame advances 1.33 ticks and the game still runs at normal speed. Below 15 fps it slows down after
  * all. Within DYN_DEADBAND of the nominal frame time the exact nominal count is used, so a device that holds its rate
  * behaves exactly as before. <data>/no_dynspeed turns it off (for A/B runs). */
-#define DYN_MAX_TICKS 3.0
+#define DYN_MAX_TICKS 4.0
 #define DYN_DEADBAND  0.08
 #define DYN_ALPHA     0.15
 #define DYN_STALL_NS  250000000ull /* a longer gap is a load, a pause or a lock screen, not a frame time */
@@ -275,7 +280,7 @@ static void dyn_speed_update(double nominal) {
         char p[600];
         snprintf(p, sizeof p, "%s/no_dynspeed", som_data_dir());
         g_dyn_off = access(p, F_OK) == 0;
-        som_log("patches: dynamic game speed %s (floor 20 fps)", g_dyn_off ? "off (no_dynspeed)" : "on");
+        som_log("patches: dynamic game speed %s (floor 15 fps)", g_dyn_off ? "off (no_dynspeed)" : "on");
     }
     if (g_fps != last_fps || !ema) last_fps = g_fps, ema = nominal;
     double dt = last_ns ? (double)(now - last_ns) : 0.0;
@@ -299,6 +304,92 @@ static void dyn_speed_update(double nominal) {
     g_hub_k = (float)(t * 0.5);
 }
 
+/* Dynamic resolution. The render scale the user picks is the ceiling; when frames keep missing the chosen frame rate the
+ * scale drops in DR_STEP% steps (of the chosen scale) down to a floor DR_MAX_STEPS * DR_STEP = 20% below it, and it climbs
+ * back one step at a time. The pacer hides spare GPU time (a frame that is on time takes exactly one period), so headroom
+ * cannot be measured: instead a lowered scale is probed upwards after a pause, and a probe that misses again is undone and
+ * the next pause doubled (DR_PROBE_MIN to DR_PROBE_MAX), so a scene that needs the lower scale does not flip-flop (every
+ * change resizes the render targets and costs a hitch). Misses are counted over DR_WINDOW_NS windows: a window with
+ * DR_BAD_PCT% or more late frames (over 1.25 periods) steps down. A stall (a load, a pause) restarts the window and the
+ * frames right after a change are not counted. <data>/no_dynres turns it off (for A/B runs). */
+#define DR_STEP        5
+#define DR_MAX_STEPS   4
+#define DR_WINDOW_NS   500000000ull
+#define DR_BAD_PCT     20
+#define DR_SKIP_FRAMES 12
+#define DR_PROBE_MIN   4000000000ull
+#define DR_PROBE_MAX   40000000000ull
+static int g_dynres_off = -1;           /* the no_dynres file (A/B runs) */
+static volatile int g_dynres_ui = 1;    /* the sidebar's Dynamic resolution box */
+
+void som_set_dynres(int on) {
+    if (g_dynres_ui != on) som_log("settings: dynamic resolution %s", on ? "on" : "off");
+    g_dynres_ui = on;
+}
+
+static void dynres_update(void) {
+    static uint64_t last_ns, win_ns, probe_ns, backoff = DR_PROBE_MIN;
+    static int frames, missed, skip, probing, last_fps, last_pct;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    uint64_t dt = last_ns ? now - last_ns : 0;
+    last_ns = now;
+    if (g_dynres_off < 0) {
+        char p[600];
+        snprintf(p, sizeof p, "%s/no_dynres", som_data_dir());
+        g_dynres_off = access(p, F_OK) == 0;
+        som_log("patches: dynamic resolution %s (floor %d%% below the chosen scale)", g_dynres_off ? "off (no_dynres)" : "on",
+                DR_STEP * DR_MAX_STEPS);
+    }
+    if (g_dynres_off || !g_dynres_ui) { /* off: the chosen scale; turning it on again starts from a clean state */
+        g_scale_eff = g_scale_pct;
+        g_dyn_step = 0;
+        last_fps = 0;
+        return;
+    }
+    if (g_fps != last_fps || g_scale_pct != last_pct) { /* a new target: start again from the chosen scale */
+        last_fps = g_fps, last_pct = g_scale_pct;
+        g_dyn_step = 0, g_scale_eff = g_scale_pct;
+        frames = missed = skip = probing = 0;
+        win_ns = now, backoff = DR_PROBE_MIN, probe_ns = 0;
+        return;
+    }
+    if (dt == 0 || dt >= DYN_STALL_NS) { /* a load or a pause: not a frame time */
+        frames = missed = 0, win_ns = now;
+        return;
+    }
+    if (skip > 0) { skip--; win_ns = now; return; }
+    frames++;
+    if ((double)dt > 1.25e9 / (double)g_fps) missed++;
+    if (now - win_ns < DR_WINDOW_NS) return;
+    int bad = frames > 0 && missed * 100 >= frames * DR_BAD_PCT;
+    frames = missed = 0, win_ns = now;
+    int step = g_dyn_step;
+    if (bad) {
+        if (probing) { /* the probe up failed: back down, and wait twice as long before the next one */
+            backoff = backoff * 2 > DR_PROBE_MAX ? DR_PROBE_MAX : backoff * 2;
+            probing = 0;
+        }
+        if (step < DR_MAX_STEPS) step++;
+        probe_ns = now + backoff;
+    } else if (step > 0) {
+        if (probing) { /* held at the higher scale */
+            probing = 0;
+            backoff = backoff / 2 < DR_PROBE_MIN ? DR_PROBE_MIN : backoff / 2;
+            probe_ns = now + backoff;
+        } else if (now >= probe_ns) {
+            step--, probing = 1;
+        }
+    }
+    if (step != g_dyn_step) {
+        g_dyn_step = step;
+        g_scale_eff = (g_scale_pct * (100 - step * DR_STEP) + 50) / 100;
+        skip = DR_SKIP_FRAMES;
+        som_log("dynres: %d%% (%d steps below the chosen %d%%)", g_scale_eff, step, g_scale_pct);
+    }
+}
+
 /* GameTime.Update, once per frame on the main thread */
 static void on_frame(GuestCtx *c) {
     graphics_frame(c);
@@ -307,23 +398,24 @@ static void on_frame(GuestCtx *c) {
     int fps = g_fps;
     if (fps != last_fps) last_fps = fps, acc = 0;
     dyn_speed_update(60.0 / fps);
+    dynres_update();
     acc += g_ticks_f;
     int n = (int)(acc + 1e-9);
     if (n < 1) n = 1;
     acc -= n;
     g_vsync_ticks = n;
-    if (g_scale_seen && g_scale_applied != g_scale_pct) { /* the slider moved: re-apply the stack's top scale */
-        g_scale_applied = g_scale_pct;
+    if (g_scale_seen && g_scale_applied != g_scale_eff) { /* the slider moved or dynamic resolution stepped: re-apply the stack's top scale */
+        g_scale_applied = g_scale_eff;
         rt_call(c, g_main_base + RVA_COMMIT_SCALE, 1, (uint64_t)0);
     }
 }
 
 static void on_vsync_count(GuestCtx *c) { ret_x(c, g_vsync_ticks); }
 static void on_vsync_time(GuestCtx *c) { set_float(c, 0, (float)g_vsync_ticks * (1.0f / 60.0f)); }
-static void on_set_vsync(GuestCtx *c) { c->x[0] = g_fps == 30 ? 2 : 1; }
+static void on_set_vsync(GuestCtx *c) { c->x[0] = g_fps == 20 ? 3 : g_fps == 30 ? 2 : 1; }
 
 static void on_set_scale(GuestCtx *c) {
-    int pct = g_scale_pct;
+    int pct = g_scale_eff;
     float base = get_float(c, 0);
     g_scale_base = base;
     g_scale_seen = 1;
@@ -358,7 +450,7 @@ static void on_offscreen_render(GuestCtx *c) {
                     (unsigned long long)rt, w, h, (int)rt_call(c, b + RVA_CAM_PIXEL_W, 2, cam, (uint64_t)0),
                     (int)rt_call(c, b + RVA_CAM_PIXEL_H, 2, cam, (uint64_t)0));
     }
-    int pct = g_scale_pct > 100 ? 100 : g_scale_pct;
+    int pct = g_scale_eff > 100 ? 100 : g_scale_eff;
     int nw = g_offscreen[i].w * pct / 100, nh = g_offscreen[i].h * pct / 100;
     if (nw < 16) nw = 16;
     if (nh < 16) nh = 16;

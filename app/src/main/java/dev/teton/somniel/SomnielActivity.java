@@ -20,8 +20,13 @@ public class SomnielActivity extends SDLActivity {
     /** Frame rate 30, 40 or 60 and render scale in percent (50 to 125): applied live (game_patches.c). */
     static native void nativeSetFrameRate(int fps);
     static native void nativeSetRenderScale(int pct);
+    static native void nativeSetDynamicResolution(boolean on);
+    static native void nativeSetBatteryTemp(int celsius);
+    static native void nativeSetSkipIntro(boolean on);
     /** The frame rate used until the user picks one: 30 on the handheld profile (Mali GPUs), else 60 (sidebar.c). */
     static native int nativeDefaultFrameRate();
+    static native boolean nativeGpuIsMali();
+    static native boolean nativeIsHandheld();
     /** Graphics options (game_patches.c): key 0 shadows (0 High .. 3 Off), 1 model detail (0 Normal .. 2 Low),
      *  2 texture sharpness (0 Normal .. 2 Soft). 0 everywhere renders as the game does. */
     static native void nativeSetGraphics(int key, int value);
@@ -162,6 +167,16 @@ public class SomnielActivity extends SDLActivity {
         nativeSetMonitorLevel(sidebar.monitorLevel());
         nativeSetFrameRate(sidebar.frameRate());
         nativeSetRenderScale(sidebar.renderScale());
+        nativeSetDynamicResolution(sidebar.dynamicResolution());
+        nativeSetSkipIntro(sidebar.skipIntro());
+        // the battery's temperature for the performance monitor: devices that hide their thermal zones from apps
+        // (Samsung) show it in place of the CPU's (sticky broadcast: the receiver gets the current value at once)
+        registerReceiver(new android.content.BroadcastReceiver() {
+            @Override public void onReceive(android.content.Context c, Intent i) {
+                int t = i.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1); // tenths of a degree
+                if (t > 0) nativeSetBatteryTemp((t + 5) / 10);
+            }
+        }, new android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         sidebar.pushGraphics();
 
         getWindow().getDecorView().post(() -> {
@@ -194,13 +209,13 @@ public class SomnielActivity extends SDLActivity {
                         + "already have. You can do this later from the sidebar: Mods.")
                 .setPositiveButton("Download", (d, w) -> sidebar.cobaltDownload(true))
                 .setNeutralButton("Import file...", (d, w) -> pickCobaltZip())
-                .setNegativeButton("Not now", (d, w) -> p.edit().putBoolean("cobalt_declined", true).apply())
+                .setNegativeButton("Not now", (d, w) -> p.edit().putBoolean("cobalt_declined", true).commit())
                 .show();
     }
 
     private Telemetry telemetry;
     private TouchControls touch;
-    private ImageView splash;
+    private android.view.View splash;
 
     /** A real controller is attached (a built-in one on a handheld counts): not a virtual or on-screen device. */
     private static boolean gamepadConnected() {
@@ -218,28 +233,98 @@ public class SomnielActivity extends SDLActivity {
     /** Shows or hides the on-screen controls: Auto = while no controller is connected; or always on / off (sidebar). */
     void updateTouchControls() {
         if (touch == null || sidebar == null) return;
-        boolean show = sidebar.touchEnabled() && !(sidebar.touchHideWithPad() && gamepadConnected());
+        boolean show = touch.isEditing() || (sidebar.touchEnabled() && !(sidebar.touchHideWithPad() && gamepadConnected()));
         int mv = sidebar.touchMoveMode();
         touch.configure(mv != 2, mv != 1, sidebar.touchFade());
         touch.setVisibility(show ? android.view.View.VISIBLE : android.view.View.GONE);
     }
 
+    TouchControls touchControls() { return touch; }
+
+    /** Closes the sidebar and lets the user drag, resize and reset the on-screen controls; shown even if they are off. */
+    void startTouchEdit() {
+        if (touch != null) touch.startEdit(this::updateTouchControls);
+    }
+
     static native boolean nativeGameHasFrames();
 
-    /** Sommie on navy covers the surface until the game presents its first frame (the native side only has a dark clear then). */
+    /**
+     * The loading bar under the splash icon: a red (the launcher icon's) fill with a light sheen running along it. How
+     * far it is filled is a guess from how long the last boot took to reach its first frame (remembered in "boot_frame_ms"): it
+     * reaches 90% at that time and then creeps, and fills the rest the moment the game draws.
+     */
+    private static final class SplashBar extends android.view.View {
+        private static final int RED = 0xFFC8283C, TRACK = 0x33FFFFFF;
+        private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.RectF r = new android.graphics.RectF();
+        private final long start = android.os.SystemClock.uptimeMillis();
+        private final long expected;
+        private float done = -1f; // set once the game draws: the fill runs from here to the end
+        private long doneAt;
+
+        SplashBar(android.content.Context c, long expectedMs) { super(c); expected = Math.max(3000, expectedMs); }
+
+        void finish() { if (done < 0) { done = progress(); doneAt = android.os.SystemClock.uptimeMillis(); } }
+
+        private float progress() {
+            float t = android.os.SystemClock.uptimeMillis() - start;
+            if (t < expected) return 0.9f * t / expected;
+            return 0.9f + 0.08f * (1f - (float) Math.exp(-(t - expected) / (double) expected));
+        }
+
+        @Override protected void onDraw(android.graphics.Canvas c) {
+            float w = getWidth() * 0.28f, h = Math.max(4f, getHeight() * 0.008f);
+            float x0 = (getWidth() - w) / 2f, y0 = getHeight() * 0.80f;
+            float p = done < 0 ? progress()
+                    : Math.min(1f, done + (1f - done) * (android.os.SystemClock.uptimeMillis() - doneAt) / 200f);
+            r.set(x0, y0, x0 + w, y0 + h);
+            paint.setShader(null);
+            paint.setColor(TRACK);
+            c.drawRoundRect(r, h / 2, h / 2, paint);
+            r.right = x0 + w * p;
+            paint.setColor(RED);
+            c.drawRoundRect(r, h / 2, h / 2, paint);
+            // the sheen: a soft light band that runs along the filled part every 1.4 s
+            float fw = w * p;
+            if (fw > h) {
+                float sx = x0 + ((android.os.SystemClock.uptimeMillis() - start) % 1400) / 1400f * (fw + w * 0.3f) - w * 0.15f;
+                paint.setShader(new android.graphics.LinearGradient(sx - w * 0.15f, 0, sx + w * 0.15f, 0,
+                        new int[] {0x00FFFFFF, 0x66FFFFFF, 0x00FFFFFF}, null, android.graphics.Shader.TileMode.CLAMP));
+                c.save();
+                c.clipRect(r);
+                c.drawRoundRect(r, h / 2, h / 2, paint);
+                c.restore();
+                paint.setShader(null);
+            }
+            postInvalidateOnAnimation();
+        }
+    }
+
+    /** Sommie on navy, with a loading bar, covers the surface until the game presents its first frame (the native side
+     *  only has a dark clear then). */
     private void showSplash() {
-        splash = new ImageView(this);
-        splash.setBackgroundColor(0xFF1B2545);
-        splash.setImageResource(R.drawable.splash_icon);
-        splash.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        splash.setPadding(0, 0, 0, 0);
+        final android.content.SharedPreferences p = getSharedPreferences("sidebar", MODE_PRIVATE);
+        final long t0 = android.os.SystemClock.uptimeMillis();
+        android.widget.FrameLayout box = new android.widget.FrameLayout(this);
+        box.setBackgroundColor(0xFF1B2545);
+        ImageView icon = new ImageView(this);
+        icon.setImageResource(R.drawable.splash_icon);
+        icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        box.addView(icon, new ViewGroup.LayoutParams(-1, -1));
+        final SplashBar bar = new SplashBar(this, p.getLong("boot_frame_ms", 3000));
+        box.addView(bar, new ViewGroup.LayoutParams(-1, -1));
+        splash = box;
         addContentView(splash, new ViewGroup.LayoutParams(-1, -1));
         final Handler h = new Handler(Looper.getMainLooper());
         h.post(new Runnable() {
             @Override public void run() {
                 if (splash == null) return;
+                long took = android.os.SystemClock.uptimeMillis() - t0;
                 if (nativeGameHasFrames()) {
-                    splash.animate().alpha(0f).setDuration(250).withEndAction(() -> {
+                    long prev = p.getLong("boot_frame_ms", took);
+                    p.edit().putLong("boot_frame_ms", (prev + took) / 2).commit(); // the next splash's guess
+                    bar.finish();
+                    splash.animate().alpha(0f).setStartDelay(220).setDuration(250).withEndAction(() -> {
                         ((ViewGroup) splash.getParent()).removeView(splash);
                         splash = null;
                     }).start();
@@ -270,7 +355,7 @@ public class SomnielActivity extends SDLActivity {
     }
 
     void setUpdateCheckEnabled(boolean on) {
-        getSharedPreferences("sidebar", MODE_PRIVATE).edit().putBoolean("update_check", on).apply();
+        getSharedPreferences("sidebar", MODE_PRIVATE).edit().putBoolean("update_check", on).commit();
     }
 
     /** The boot check: at most once every 6 hours, only when the user has not turned it off. */
@@ -279,7 +364,7 @@ public class SomnielActivity extends SDLActivity {
         android.content.SharedPreferences p = getSharedPreferences("sidebar", MODE_PRIVATE);
         long now = System.currentTimeMillis();
         if (now - p.getLong("update_last", 0) < 6L * 3600 * 1000) return;
-        p.edit().putLong("update_last", now).apply();
+        p.edit().putLong("update_last", now).commit();
         checkForUpdates(false);
     }
 
@@ -320,7 +405,7 @@ public class SomnielActivity extends SDLActivity {
                 .setPositiveButton("Update now", (d, w) -> startUpdate(rel))
                 .setNegativeButton("Later", null);
         if (!manual) b.setNeutralButton("Skip this version",
-                (d, w) -> getSharedPreferences("sidebar", MODE_PRIVATE).edit().putString("update_skip", rel.tag).apply());
+                (d, w) -> getSharedPreferences("sidebar", MODE_PRIVATE).edit().putString("update_skip", rel.tag).commit());
         b.show();
     }
 
@@ -385,6 +470,10 @@ public class SomnielActivity extends SDLActivity {
             return true;
         }
         boolean down = e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0;
+        if (k == KeyEvent.KEYCODE_BACK && touch != null && touch.isEditing()) { // Back ends the layout editor
+            if (down) touch.endEdit();
+            return true;
+        }
         if (k == KeyEvent.KEYCODE_BACK) {
             if (down) {
                 if (sidebar.isOpen()) sidebar.back(); else sidebar.open();
@@ -408,6 +497,7 @@ public class SomnielActivity extends SDLActivity {
     @Override
     public void onBackPressed() {
         if (sidebar == null || (setup != null && setup.isShowing())) return;
+        if (touch != null && touch.isEditing()) { touch.endEdit(); return; }
         if (sidebar.isOpen()) sidebar.back(); else sidebar.open();
     }
 
@@ -420,6 +510,17 @@ public class SomnielActivity extends SDLActivity {
     private static final int REQ_IMPORT_MOD = 0x5D02;
     private static final int REQ_IMPORT_COBALT = 0x5D03;
     private static final int REQ_IMPORT_SAVES = 0x5D04;
+
+    private static final int REQ_EXPORT_SAVES = 0x5D05;
+
+    /** Opens the system "save as" picker for the saves export (a .zip). */
+    void pickSaveExport(String name) {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/zip");
+        i.putExtra(Intent.EXTRA_TITLE, name);
+        startActivityForResult(i, REQ_EXPORT_SAVES);
+    }
 
     /** Opens the system file picker for saves: one .zip, or the save files themselves (several at once). */
     void pickSaves() {
@@ -485,6 +586,11 @@ public class SomnielActivity extends SDLActivity {
         if (req == REQ_IMPORT_COBALT) {
             if (res == RESULT_OK && data != null && data.getData() != null && sidebar != null)
                 sidebar.importCobalt(data.getData());
+            return;
+        }
+        if (req == REQ_EXPORT_SAVES) {
+            if (res == RESULT_OK && data != null && data.getData() != null && sidebar != null)
+                sidebar.exportSaves(data.getData());
             return;
         }
         if (req == REQ_IMPORT_SAVES) {

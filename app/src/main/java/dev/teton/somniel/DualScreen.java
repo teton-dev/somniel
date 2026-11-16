@@ -46,7 +46,7 @@ final class DualScreen {
     boolean enabled() { return prefs.getBoolean("dualscreen_enabled", true); }
 
     void setEnabled(boolean on) {
-        prefs.edit().putBoolean("dualscreen_enabled", on).apply();
+        prefs.edit().putBoolean("dualscreen_enabled", on).commit();
         if (on) { start(); show(); } else hide();
     }
 

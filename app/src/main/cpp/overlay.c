@@ -25,17 +25,20 @@
 extern const char *som_data_dir(void);
 extern int som_target_fps(void); /* game_patches.c: the chosen frame rate, 0 if the hooks are off */
 
-#define SCALE 3
+/* The pixel size of the font follows the screen: 3 at 1080 lines and up, 2 below that, 1 under 540 lines. Everything
+ * else is sized from it (the numbers below are at 3). */
+static int g_sc = 3;
+#define SCALE g_sc
 #define CW (6 * SCALE)       /* advance per character */
 #define TH (7 * SCALE)       /* glyph height */
-#define PAD 8
-#define GAP 12               /* between the bar's parts */
-#define GW 180               /* graph width: GW / 2 frames at 2 px each */
-#define GH 36                /* graph height */
-#define VPAD 4               /* above and below the bar's contents: it is flush with the top edge, so it stays thin */
-#define NSAMP (GW / 2)
-#define MAXW 1728            /* the widest bar: level 4 on 8 cores */
-#define MAXH (VPAD * 2 + GH)
+#define PAD (8 * SCALE / 3)
+#define GAP (12 * SCALE / 3) /* between the bar's parts */
+#define GW (60 * SCALE)      /* graph width: GW / 2 frames at 2 px each */
+#define GH (12 * SCALE)      /* graph height */
+#define VPAD (4 * SCALE / 3) /* above and below the bar's contents: it is flush with the top edge, so it stays thin */
+#define NSAMP_MAX 90         /* GW / 2 at the largest size */
+#define MAXW 1728            /* the widest bar: level 4 on 8 cores at the largest size */
+#define MAXH 44              /* VPAD * 2 + GH at the largest size */
 #define SLOTS 2
 
 static VkBuffer buf[SLOTS];
@@ -43,8 +46,10 @@ static VkDeviceMemory mem[SLOTS];
 static uint8_t *ptr[SLOTS];
 static int ready = -1;
 static volatile int g_level = 2;
+static volatile int g_battery_c = -1; /* the battery's temperature (Java, BatteryManager): shown when no CPU zone can be read */
 
 void overlay_set_level(int level) { g_level = level < 0 ? 0 : level > 4 ? 4 : level; }
+void overlay_set_battery_temp(int c) { g_battery_c = c > 0 && c < 150 ? c : -1; }
 
 /* 5x7 glyphs, one byte per row, bit 4 = leftmost column */
 static const uint8_t *glyph(char c) {
@@ -63,6 +68,8 @@ static const uint8_t *glyph(char c) {
         {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}}, {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}},
         {'z', {0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F}},
         {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}}, {'-', {0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00}},
+        {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}}, {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+        {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}}, {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
     };
     if (c >= '0' && c <= '9') return digits[c - '0'];
     for (unsigned i = 0; i < sizeof letters / sizeof letters[0]; i++)
@@ -111,8 +118,8 @@ static int enabled(void) {
 /* ---- temperatures: the hottest thermal zone whose type names a CPU core or cluster, and the same for the GPU ---- */
 
 #define MAXZ 48
-static char cpu_zone[MAXZ][96], gpu_zone[MAXZ][96];
-static int n_cpu, n_gpu, zones_found;
+static char cpu_zone[MAXZ][96], gpu_zone[MAXZ][96], soc_zone[MAXZ][96];
+static int n_cpu, n_gpu, n_soc, zones_found;
 
 static int read_file(const char *path, char *out, int n) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -124,28 +131,47 @@ static int read_file(const char *path, char *out, int n) {
     return r;
 }
 
+/* What a thermal zone measures, from its (lower-cased) type. The names differ by chip maker:
+ *   Qualcomm  cpu-1-0-usr, cpuss-0, gpuss-0-usr
+ *   MediaTek  cpu-big-core0, mtktscpu, gpu1, mtktsgpu, soc_max, mtktsAP
+ *   Exynos and Google Tensor  BIG, MID, LITTLE, G3D
+ *   UNISOC    cputop0-thmzone, cpu-thmzone, gpu-thmzone, soc-thmzone
+ * 2 = GPU, 1 = CPU, 3 = the whole SoC (stands in for the CPU when there is no CPU zone), 0 = something else. */
+static int zone_kind(const char *t) {
+    if (strstr(t, "gpu") || strstr(t, "g3d") || strstr(t, "mali")) return 2;
+    if (strstr(t, "cpu") || strstr(t, "cluster") || !strcmp(t, "big") || !strcmp(t, "mid") || !strcmp(t, "little") ||
+        strstr(t, "big_") || strstr(t, "little_"))
+        return 1;
+    if (strstr(t, "soc") || strstr(t, "tsap") || !strcmp(t, "ap")) return 3;
+    return 0;
+}
+
 static void find_zones(void) {
     zones_found = 1;
-    DIR *d = opendir("/sys/class/thermal");
-    if (!d) return;
+    DIR *d = opendir("/sys/class/thermal"); /* refused to apps on some devices (Samsung): the fallbacks below still run */
     struct dirent *e;
-    while ((e = readdir(d))) {
+    while (d && (e = readdir(d))) {
         if (strncmp(e->d_name, "thermal_zone", 12)) continue;
         char p[128], type[64];
         snprintf(p, sizeof p, "/sys/class/thermal/%s/type", e->d_name);
         if (read_file(p, type, sizeof type) <= 0) continue;
-        for (char *c = type; *c; c++) *c = (char)tolower((unsigned char)*c);
+        for (char *c = type; *c; c++) *c = *c == '\n' ? 0 : (char)tolower((unsigned char)*c);
         snprintf(p, sizeof p, "/sys/class/thermal/%s/temp", e->d_name);
         char probe[32];
         if (read_file(p, probe, sizeof probe) <= 0) continue; /* some zones refuse to be read */
-        if (strstr(type, "gpu")) {
-            if (n_gpu < MAXZ) snprintf(gpu_zone[n_gpu++], sizeof gpu_zone[0], "%s", p);
-        } else if (strstr(type, "cpu")) {
-            if (n_cpu < MAXZ) snprintf(cpu_zone[n_cpu++], sizeof cpu_zone[0], "%s", p);
-        }
+        int k = zone_kind(type);
+        if (k == 2 && n_gpu < MAXZ) snprintf(gpu_zone[n_gpu++], sizeof gpu_zone[0], "%s", p);
+        else if (k == 1 && n_cpu < MAXZ) snprintf(cpu_zone[n_cpu++], sizeof cpu_zone[0], "%s", p);
+        else if (k == 3 && n_soc < MAXZ) snprintf(soc_zone[n_soc++], sizeof soc_zone[0], "%s", p);
     }
-    closedir(d);
-    som_log("overlay: thermal zones: %d cpu, %d gpu", n_cpu, n_gpu);
+    if (d) closedir(d);
+    /* Samsung kernels (Exynos and MediaTek alike) hide the thermal zones from apps but publish the GPU's temperature,
+     * in plain degrees, under /sys/kernel/gpu */
+    char probe[32];
+    if (!n_gpu && read_file("/sys/kernel/gpu/gpu_tmu", probe, sizeof probe) > 0)
+        snprintf(gpu_zone[n_gpu++], sizeof gpu_zone[0], "%s", "/sys/kernel/gpu/gpu_tmu");
+    som_log("overlay: thermal zones: %d cpu, %d gpu, %d soc%s", n_cpu, n_gpu, n_soc,
+            n_cpu ? "" : n_soc ? " (CPU: the SoC's temperature instead)" : " (CPU: the battery's temperature instead)");
 }
 
 /* the hottest of the zones, in degrees C, or -1 */
@@ -195,6 +221,101 @@ static void find_cores(void) {
     som_log("overlay: clocks shown for %d of %d cores (efficiency cores left out)", n_cores, nh);
 }
 
+/* The GPU's clock file. Chip makers and kernels put it in different places, and in different units, so the first
+ * readable file from a list is used, and its unit is told from the size of the number (a GPU runs at 50 MHz to 5 GHz):
+ *   Qualcomm (Adreno)   /sys/class/kgsl/kgsl-3d0/gpuclk, Hz
+ *   Samsung kernels     /sys/kernel/gpu/gpu_clock, kHz (Exynos and Samsung's MediaTek phones and tablets)
+ *   MediaTek            /sys/module/ged/parameters/gpu_cur_freq, kHz
+ *   Google Tensor       /sys/devices/platform/1f000000.mali/cur_freq, kHz
+ *   Exynos (older)      /sys/class/misc/mali0/device/clock, MHz
+ *   UNISOC and others   a devfreq device named after the GPU (gpu, mali, g3d) in /sys/class/devfreq or under
+ *                       /sys/devices/platform, cur_freq in Hz */
+static char gpu_clk_path[192];
+static int gpu_clk_found;
+
+static long plausible_hz(long v) {
+    if (v >= 50000000L) return v;                 /* Hz */
+    if (v >= 50000L) return v * 1000;             /* kHz */
+    if (v >= 50 && v < 5000) return v * 1000000;  /* MHz */
+    return 0;
+}
+
+/* the first number in the file, as Hz (0: unreadable, or the GPU is idle and reports 0) */
+static long read_gpu_hz(const char *p) {
+    char b[64];
+    if (read_file(p, b, sizeof b) <= 0) return 0;
+    char *s = b;
+    while (*s && !isdigit((unsigned char)*s)) s++;
+    return *s ? plausible_hz(strtol(s, NULL, 10)) : 0;
+}
+
+static int try_gpu_clock(const char *p) {
+    char b[64];
+    if (read_file(p, b, sizeof b) <= 0) return 0;
+    for (char *s = b; *s; s++)
+        if (isdigit((unsigned char)*s)) {
+            snprintf(gpu_clk_path, sizeof gpu_clk_path, "%s", p);
+            return 1;
+        }
+    return 0;
+}
+
+static int gpu_name(const char *n) {
+    char l[128];
+    int i = 0;
+    for (; n[i] && i < (int)sizeof l - 1; i++) l[i] = (char)tolower((unsigned char)n[i]);
+    l[i] = 0;
+    return strstr(l, "gpu") || strstr(l, "mali") || strstr(l, "kgsl") || strstr(l, "g3d");
+}
+
+/* a devfreq-style folder: its cur_freq, else clock, else a devfreq child's cur_freq */
+static int try_gpu_dir(const char *dir) {
+    char p[192];
+    snprintf(p, sizeof p, "%s/cur_freq", dir);
+    if (try_gpu_clock(p)) return 1;
+    snprintf(p, sizeof p, "%s/clock", dir);
+    if (try_gpu_clock(p)) return 1;
+    snprintf(p, sizeof p, "%s/devfreq", dir);
+    DIR *d = opendir(p);
+    struct dirent *e;
+    int ok = 0;
+    while (d && !ok && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "%s/devfreq/%s/cur_freq", dir, e->d_name);
+        ok = try_gpu_clock(p);
+    }
+    if (d) closedir(d);
+    return ok;
+}
+
+static int scan_gpu_dirs(const char *root) {
+    DIR *d = opendir(root);
+    struct dirent *e;
+    int ok = 0;
+    while (d && !ok && (e = readdir(d))) {
+        if (e->d_name[0] == '.' || !gpu_name(e->d_name)) continue;
+        char p[192];
+        snprintf(p, sizeof p, "%s/%s", root, e->d_name);
+        ok = try_gpu_dir(p);
+    }
+    if (d) closedir(d);
+    return ok;
+}
+
+static void find_gpu_clock(void) {
+    gpu_clk_found = 1;
+    static const char *const fixed[] = {
+        "/sys/class/kgsl/kgsl-3d0/gpuclk", "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", "/sys/kernel/gpu/gpu_clock",
+        "/sys/module/ged/parameters/gpu_cur_freq", "/sys/devices/platform/1f000000.mali/cur_freq",
+        "/sys/class/misc/mali0/device/cur_freq", "/sys/class/misc/mali0/device/clock"};
+    int ok = 0;
+    for (unsigned i = 0; i < sizeof fixed / sizeof fixed[0] && !ok; i++) ok = try_gpu_clock(fixed[i]);
+    if (!ok) ok = scan_gpu_dirs("/sys/class/devfreq");
+    if (!ok) ok = scan_gpu_dirs("/sys/devices/platform");
+    if (!ok) gpu_clk_path[0] = 0;
+    som_log("overlay: GPU clock from %s", ok ? gpu_clk_path : "nowhere (not exposed to apps): left out");
+}
+
 /* "CPU 2.8 2.8 2.8 2.8 3.2GHz" (GHz, one decimal; "-.-" for a core that is off) and "GPU 401MHz". Only the performance
  * cores are listed: the low-power (efficiency) ones, which have the lowest capacity, are left out. */
 static void read_clocks(char *cpu, int cn, char *gpu, int gn) {
@@ -209,14 +330,10 @@ static void read_clocks(char *cpu, int cn, char *gpu, int gn) {
         else o += snprintf(cpu + o, cn - o, " -.-");
     }
     snprintf(cpu + o, cn - o, "GHz");
-    static const char *const gpu_files[] = {"/sys/class/kgsl/kgsl-3d0/gpuclk", "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
-                                            "/sys/class/devfreq/3d00000.qcom,kgsl-3d0/cur_freq"};
-    long hz = 0;
-    for (unsigned i = 0; i < sizeof gpu_files / sizeof gpu_files[0] && hz <= 0; i++) {
-        char b[32];
-        if (read_file(gpu_files[i], b, sizeof b) > 0) hz = strtol(b, NULL, 10);
-    }
-    if (hz > 0) snprintf(gpu, gn, "GPU %ldMHz", hz / 1000000); else snprintf(gpu, gn, "GPU --");
+    if (n_cores == 0) cpu[0] = 0; /* no readable core clock: left out */
+    if (!gpu_clk_found) find_gpu_clock();
+    long hz = gpu_clk_path[0] ? read_gpu_hz(gpu_clk_path) : 0;
+    if (hz > 0) snprintf(gpu, gn, "GPU %ldMHz", hz / 1000000); else gpu[0] = 0; /* not exposed: left out */
 }
 
 /* ---- drawing ---- */
@@ -287,11 +404,12 @@ static Rgb temp_col(int c) { return c >= 85 ? (Rgb){255, 80, 80} : c >= 72 ? (Rg
 
 void overlay_draw(VkCommandBuffer cb, VkImage dst, VkFormat fmt, VkExtent2D ext, uint32_t slot) {
     int level = g_level;
-    if (level <= 0 || !enabled() || ext.height < MAXH || !init()) return;
+    g_sc = ext.height >= 1080 ? 3 : ext.height >= 540 ? 2 : 1;
+    if (level <= 0 || !enabled() || ext.height < (uint32_t)MAXH || !init()) return;
     slot %= SLOTS;
     /* the text changes four times a second: readable, and the same numbers as the log's windows */
     static char t_fps[16], t_ms[16], t_cpu[16], t_gpu[16], t_clk[96], t_gclk[24];
-    static float times[NSAMP];
+    static float times[NSAMP_MAX];
     static int ntimes;
     static uint64_t next_ns, next_temp_ns, next_clk_ns;
     static Rgb fps_col = {255, 255, 255};
@@ -313,7 +431,7 @@ void overlay_draw(VkCommandBuffer cb, VkImage dst, VkFormat fmt, VkExtent2D ext,
         /* green: within 5% of 60; yellow: within 5% of 30; red: below that */
         fps_col = st.fps >= 57.0f ? (Rgb){80, 255, 80} : st.fps >= 28.5f ? (Rgb){255, 230, 60} : (Rgb){255, 80, 80};
     }
-    if (level >= 2) ntimes = vkr_frame_times(times, NSAMP); /* every frame: the graph scrolls with the game */
+    if (level >= 2) ntimes = vkr_frame_times(times, GW / 2); /* every frame: the graph scrolls with the game */
     if (level >= 4 && now >= next_clk_ns) {
         next_clk_ns = now + 250000000ull;
         read_clocks(t_clk, sizeof t_clk, t_gclk, sizeof t_gclk);
@@ -323,8 +441,11 @@ void overlay_draw(VkCommandBuffer cb, VkImage dst, VkFormat fmt, VkExtent2D ext,
         if (!zones_found) find_zones();
         cpu_c = hottest(cpu_zone, n_cpu);
         gpu_c = hottest(gpu_zone, n_gpu);
-        if (cpu_c >= 0) snprintf(t_cpu, sizeof t_cpu, "CPU %2d^C", cpu_c); else snprintf(t_cpu, sizeof t_cpu, "CPU --");
-        if (gpu_c >= 0) snprintf(t_gpu, sizeof t_gpu, "GPU %2d^C", gpu_c); else snprintf(t_gpu, sizeof t_gpu, "GPU --");
+        if (cpu_c >= 0) snprintf(t_cpu, sizeof t_cpu, "CPU %2d^C", cpu_c);
+        else if (!n_cpu && n_soc && (cpu_c = hottest(soc_zone, n_soc)) >= 0) snprintf(t_cpu, sizeof t_cpu, "SOC %2d^C", cpu_c);
+        else if (!n_cpu && (cpu_c = g_battery_c) >= 0) snprintf(t_cpu, sizeof t_cpu, "BAT %2d^C", cpu_c);
+        else t_cpu[0] = 0; /* nothing readable: the part is left out */
+        if (gpu_c >= 0) snprintf(t_gpu, sizeof t_gpu, "GPU %2d^C", gpu_c); else t_gpu[0] = 0;
     }
 
     g_px = ptr[slot];
@@ -332,8 +453,11 @@ void overlay_draw(VkCommandBuffer cb, VkImage dst, VkFormat fmt, VkExtent2D ext,
     int h = level == 1 ? VPAD * 2 + TH : VPAD * 2 + GH;
     int w = PAD * 2 + 9 * CW; /* "FPS 100.0" */
     if (level >= 2) w += GAP + 6 * CW + GAP + GW;
-    if (level >= 3) w += GAP + 8 * CW + GAP + 8 * CW;
-    if (level >= 4) w += GAP + (int)strlen(t_clk) * CW + GAP + (int)strlen(t_gclk) * CW;
+    /* the parts a device does not expose are empty strings and take no room */
+    if (level >= 3 && t_cpu[0]) w += GAP + (int)strlen(t_cpu) * CW;
+    if (level >= 3 && t_gpu[0]) w += GAP + (int)strlen(t_gpu) * CW;
+    if (level >= 4 && t_clk[0]) w += GAP + (int)strlen(t_clk) * CW;
+    if (level >= 4 && t_gclk[0]) w += GAP + (int)strlen(t_gclk) * CW;
     if (w > MAXW) w = MAXW;
     if ((int)ext.width < w) return; /* a screen too narrow for this level */
     for (int y = 0; y < h; y++)
@@ -348,12 +472,12 @@ void overlay_draw(VkCommandBuffer cb, VkImage dst, VkFormat fmt, VkExtent2D ext,
         x += GW + GAP;
     }
     if (level >= 3) {
-        x = put_text(x, h, t_cpu, temp_col(cpu_c)) + GAP;
-        x = put_text(x, h, t_gpu, temp_col(gpu_c)) + GAP;
+        if (t_cpu[0]) x = put_text(x, h, t_cpu, temp_col(cpu_c)) + GAP;
+        if (t_gpu[0]) x = put_text(x, h, t_gpu, temp_col(gpu_c)) + GAP;
     }
     if (level >= 4) {
-        x = put_text(x, h, t_clk, (Rgb){190, 215, 255}) + GAP;
-        put_text(x, h, t_gclk, (Rgb){190, 215, 255});
+        if (t_clk[0]) x = put_text(x, h, t_clk, (Rgb){190, 215, 255}) + GAP;
+        if (t_gclk[0]) put_text(x, h, t_gclk, (Rgb){190, 215, 255});
     }
 
     /* after the frame's blit into the same image */

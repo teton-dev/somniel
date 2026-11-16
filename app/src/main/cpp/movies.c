@@ -97,6 +97,51 @@ static int load_index(void) {
     return g_nmv;
 }
 
+#define INTRO_MOVIE "S01F"
+/* From the game's first read of the intro, A is tapped (SKIP_ON_NS down, SKIP_OFF_NS up, so every tap is a fresh press
+ * the game sees) until the movie decoder stops, so the skip lands the moment the player starts taking input, before
+ * the movie is underway. SKIP_GIVEUP_NS without a Stop: the intro is left to play. */
+#define SKIP_ON_NS     100000000LL
+#define SKIP_OFF_NS    150000000LL
+#define SKIP_GIVEUP_NS 10000000000LL
+static volatile int g_skip_on;
+static volatile int g_skip_state; /* 0 waiting for the intro, 1 pressing, 2 done for this run */
+static volatile int64_t g_skip_at;
+
+#define SKIP_TAIL_NS 400000000LL /* the intro's sound still queued in the output ring when the skip lands */
+static volatile int64_t g_unmute_ns;
+
+int movies_audio_muted(void) {
+    if (g_skip_state == 1) return 1;
+    int64_t u = g_unmute_ns;
+    return u && now_ns() < u;
+}
+
+void movies_set_skip_intro(int on) {
+    if (g_skip_on != on) som_log("settings: skip intro %s", on ? "on" : "off");
+    g_skip_on = on;
+}
+
+uint64_t movies_skip_buttons(void) {
+    if (g_skip_state != 1) return 0;
+    int64_t t = now_ns(), since = t - g_skip_at;
+    if (since >= SKIP_GIVEUP_NS) {
+        g_unmute_ns = t; /* the intro plays on: let it be heard */
+        g_skip_state = 2;
+        som_log("movies: intro still playing after %lld s of presses: left alone", (long long)(SKIP_GIVEUP_NS / 1000000000LL));
+        return 0;
+    }
+    return since % (SKIP_ON_NS + SKIP_OFF_NS) < SKIP_ON_NS ? 1 : 0; /* NP_A (main.c) */
+}
+
+void movies_note_stop(void) {
+    if (g_skip_state == 1) {
+        g_unmute_ns = now_ns() + SKIP_TAIL_NS;
+        g_skip_state = 2;
+        som_log("movies: intro skipped %.2f s after its first read", (now_ns() - g_skip_at) / 1e9);
+    }
+}
+
 void movies_note_read(uint64_t off, uint64_t size) {
     if (!g_nmv || !size) return;
     int lo = 0, hi = g_nmv - 1, hit = -1; /* the last movie starting at or before the end of the read */
@@ -107,6 +152,12 @@ void movies_note_read(uint64_t off, uint64_t size) {
     }
     if (hit < 0 || off >= g_mv[hit].start + g_mv[hit].size) return;
     if (g_recent != hit) som_log("movies: the game reads %s.webm", g_mv[hit].name);
+    if (g_skip_on && g_skip_state == 0 && !strcmp(g_mv[hit].name, INTRO_MOVIE)) {
+        g_skip_state = 1, g_skip_at = now_ns();
+        som_log("movies: skipping the intro (%s)", INTRO_MOVIE);
+    } else if (g_skip_state == 0 && !strcmp(g_mv[hit].name, INTRO_MOVIE)) {
+        g_skip_state = 2; /* skip intro off: the first showing plays, and later ones are never touched */
+    }
     g_recent = hit;
     g_recent_ns = g_mv[hit].read_ns = now_ns();
     if (!g_mv[hit].state) g_want = hit; /* convert this one next */

@@ -5,6 +5,7 @@
 /* The monitor level, set from the sidebar: 0 off; 1 the FPS; 2 FPS, frame time and a frame-time graph; 3 adds the CPU
  * and GPU temperatures; 4 adds each CPU core's clock and the GPU clock. Level 2 until set. A plain int read once per frame. */
 void overlay_set_level(int level);
+void overlay_set_battery_temp(int celsius); /* shown in place of the CPU temperature when no CPU zone is readable */
 
 /* Draw the frame-rate overlay into dst (layout TRANSFER_DST_OPTIMAL), after the game's frame was blitted there.
  * slot: the window loop's frame-in-flight index (each slot has its own staging buffer). */

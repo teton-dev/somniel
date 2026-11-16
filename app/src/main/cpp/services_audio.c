@@ -4,9 +4,12 @@
  * Structure layouts follow the public switchbrew audio notes. */
 
 #include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "debug_log.h"
 #include "guest.h"
@@ -187,72 +190,298 @@ static void audren_handler(IpcObject *self, const IpcRequest *rq, IpcResponse *r
 
 /* ---- the host sink: each audout's PCM16 goes into a ring that an AAudio stream plays. The service keeps pacing the
  * game by its own clock (buffers are released when they would have finished playing); the ring absorbs the drift
- * between that clock and the device's, dropping the oldest audio past 250 ms and playing silence when it runs dry. */
+ * between that clock and the device's, dropping the oldest audio past 250 ms and playing silence when it runs dry.
+ *
+ * Robustness (a user on a Snapdragon 8 Gen 1 phone had no sound and we cannot test there):
+ *  - the stream is opened through a fallback chain (low latency -> plain -> stereo -> float) and a configuration is
+ *    only taken when the device gives back exactly the rate, channel count and format asked for; the last step takes
+ *    whatever the device offers and the callback converts to it;
+ *  - an error callback (DISCONNECTED: route change, audio server restart, MMAP stream stolen) reopens the stream on a
+ *    helper thread instead of leaving it dead for the rest of the session;
+ *  - the stat line reports callbacks, state, sharing/performance mode, xruns and reopens so a user's log tells which
+ *    case happened. */
 #include <aaudio/AAudio.h>
 #include <stdatomic.h>
 
 #define SINK_FRAMES (48000 / 2) /* ring capacity: half a second */
 typedef struct Sink {
+    pthread_mutex_t mu;     /* stream open/close/start/pause */
     AAudioStream *st;
-    uint32_t rate, channels;
+    uint32_t rate, channels; /* what the game writes (ring layout) */
+    uint32_t out_ch;         /* what the stream takes */
+    uint32_t prime_frames;   /* queued frames needed before playback (re)starts */
+    int out_float;
     int16_t *ring;          /* SINK_FRAMES * channels samples */
     _Atomic uint64_t wr, rd; /* frame counters */
     int primed;
     uint64_t underruns;
+    _Atomic uint64_t callbacks;
+    _Atomic int reopening;
+    uint32_t reopens, open_fails;
+    int last_error;
+    uint64_t wd_cb, wd_wr; /* watchdog: callbacks / frames written at the previous stat line */
+    int wd_stuck;          /* stat lines in a row where the game wrote audio but the device asked for none */
 } Sink;
+
+static _Atomic int g_audio_paused;
+
+/* ---- audio failure report: once per run, copy somniel.log to Download/Somniel_log (LogExporter.java) and show a
+ * toast, so a user on a device we cannot test can send us the log without adb. ---- */
+#include <jni.h>
+void *SDL_GetAndroidJNIEnv(void);
+void *SDL_GetAndroidActivity(void);
+
+static _Atomic int g_fail_reported;
+static char g_fail_reason[256];
+
+static void *fail_report_thread(void *arg) {
+    (void)arg;
+    sleep(3); /* let the next few log lines (stats, retries) land in the copy */
+    char path[600];
+    snprintf(path, sizeof path, "%s/somniel.log", som_log_dir());
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = env ? (jobject)SDL_GetAndroidActivity() : NULL;
+    int ok = 0;
+    if (env && act) {
+        /* app classes are not visible to FindClass on a native thread: go through the activity's class loader */
+        jclass ak = (*env)->GetObjectClass(env, act);
+        jmethodID gcl = (*env)->GetMethodID(env, ak, "getClassLoader", "()Ljava/lang/ClassLoader;");
+        jobject loader = gcl ? (*env)->CallObjectMethod(env, act, gcl) : NULL;
+        jclass lk = loader ? (*env)->GetObjectClass(env, loader) : NULL;
+        jmethodID lc = lk ? (*env)->GetMethodID(env, lk, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") : NULL;
+        jstring cn = (*env)->NewStringUTF(env, "dev.teton.somniel.LogExporter");
+        jclass ek = lc ? (jclass)(*env)->CallObjectMethod(env, loader, lc, cn) : NULL;
+        if ((*env)->ExceptionCheck(env)) ek = NULL;
+        jmethodID m = ek ? (*env)->GetStaticMethodID(env, ek, "saveAudioLog", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)V") : NULL;
+        if (m) {
+            jstring jp = (*env)->NewStringUTF(env, path), jr = (*env)->NewStringUTF(env, g_fail_reason);
+            (*env)->CallStaticVoidMethod(env, ek, m, act, jp, jr);
+            ok = !(*env)->ExceptionCheck(env);
+            (*env)->DeleteLocalRef(env, jp);
+            (*env)->DeleteLocalRef(env, jr);
+        }
+        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+        (*env)->DeleteLocalRef(env, cn);
+        if (ek) (*env)->DeleteLocalRef(env, ek);
+        if (lk) (*env)->DeleteLocalRef(env, lk);
+        if (loader) (*env)->DeleteLocalRef(env, loader);
+        (*env)->DeleteLocalRef(env, ak);
+        (*env)->DeleteLocalRef(env, act);
+    }
+    som_log("audio: failure log export %s", ok ? "handed to LogExporter" : "FAILED (no JNI/activity/class)");
+    return NULL;
+}
+
+static void audio_fail_report(const char *fmt, ...) {
+    if (atomic_exchange(&g_fail_reported, 1)) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_fail_reason, sizeof g_fail_reason, fmt, ap);
+    va_end(ap);
+    som_log("audio: FAILURE: %s (saving the log to Download/Somniel_log)", g_fail_reason);
+    pthread_t t;
+    if (pthread_create(&t, NULL, fail_report_thread, NULL) == 0) pthread_detach(t);
+}
+
+/* one output frame from one ring frame: copy, downmix 5.1 (FL FR FC LFE BL BR) / anything to stereo or mono, or pad */
+static inline void mix_frame(const Sink *s, const int16_t *in, float *o) {
+    uint32_t ic = s->channels, oc = s->out_ch;
+    if (ic == oc) {
+        for (uint32_t c = 0; c < oc; c++) o[c] = in[c];
+    } else if (oc == 2 && ic == 6) {
+        o[0] = in[0] + 0.7071f * (in[2] + in[4]);
+        o[1] = in[1] + 0.7071f * (in[2] + in[5]);
+    } else if (oc == 1) {
+        float m = ic >= 2 ? 0.5f * (in[0] + in[1]) : in[0];
+        o[0] = m;
+    } else if (ic == 1) {
+        for (uint32_t c = 0; c < oc; c++) o[c] = c < 2 ? in[0] : 0;
+    } else {
+        for (uint32_t c = 0; c < oc; c++) o[c] = c < ic ? in[c] : 0;
+    }
+}
 
 static aaudio_data_callback_result_t sink_cb(AAudioStream *st, void *user, void *data, int32_t frames) {
     (void)st;
     Sink *s = user;
-    int16_t *out = data;
+    atomic_fetch_add_explicit(&s->callbacks, 1, memory_order_relaxed);
+    size_t out_bytes = (size_t)frames * s->out_ch * (s->out_float ? 4 : 2);
     uint64_t wr = atomic_load_explicit(&s->wr, memory_order_acquire), rd = atomic_load_explicit(&s->rd, memory_order_relaxed);
     uint64_t have = wr - rd;
-    if (!s->primed) { /* start once 40 ms are queued, so playback does not open on an underrun */
-        if (have < s->rate / 25) {
-            memset(out, 0, (size_t)frames * s->channels * 2);
+    if (!s->primed) { /* start once 40 ms (or a burst + 10 ms) are queued, so playback does not open on an underrun */
+        if (have < s->prime_frames) {
+            memset(data, 0, out_bytes);
             return AAUDIO_CALLBACK_RESULT_CONTINUE;
         }
         s->primed = 1;
     }
     uint64_t n = have < (uint64_t)frames ? have : (uint64_t)frames;
-    for (uint64_t i = 0; i < n; i++)
-        memcpy(out + i * s->channels, s->ring + ((rd + i) % SINK_FRAMES) * s->channels, s->channels * 2);
+    if (!s->out_float && s->out_ch == s->channels) { /* the common case: straight copy */
+        int16_t *out = data;
+        for (uint64_t i = 0; i < n; i++)
+            memcpy(out + i * s->channels, s->ring + ((rd + i) % SINK_FRAMES) * s->channels, s->channels * 2);
+    } else {
+        float f[8];
+        for (uint64_t i = 0; i < n; i++) {
+            mix_frame(s, s->ring + ((rd + i) % SINK_FRAMES) * s->channels, f);
+            for (uint32_t c = 0; c < s->out_ch; c++) {
+                float v = f[c];
+                if (s->out_float) {
+                    ((float *)data)[i * s->out_ch + c] = v * (1.0f / 32768.0f);
+                } else {
+                    if (v > 32767.f) v = 32767.f;
+                    if (v < -32768.f) v = -32768.f;
+                    ((int16_t *)data)[i * s->out_ch + c] = (int16_t)v;
+                }
+            }
+        }
+    }
     if (n < (uint64_t)frames) {
-        memset(out + n * s->channels, 0, (size_t)(frames - n) * s->channels * 2);
+        size_t fb = s->out_ch * (s->out_float ? 4 : 2);
+        memset((char *)data + n * fb, 0, (size_t)(frames - n) * fb);
         s->underruns++;
         s->primed = 0;
     }
     atomic_store_explicit(&s->rd, rd + n, memory_order_release);
+    extern int movies_audio_muted(void); /* movies.c: Skip intro silences the intro until it is skipped */
+    if (movies_audio_muted()) memset(data, 0, out_bytes);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+static void sink_err_cb(AAudioStream *st, void *user, aaudio_result_t err);
+
+static const char *perf_name(int m) {
+    return m == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? "low-latency" : m == AAUDIO_PERFORMANCE_MODE_POWER_SAVING ? "power-saving" : "none";
+}
+
+/* Open (not start) a stream through the fallback chain. Called with s->mu held. */
+static void sink_open_stream(Sink *s) {
+    static const struct { int perf, ch2, fl; } chain[] = {
+        {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY, 0, 0},
+        {AAUDIO_PERFORMANCE_MODE_NONE, 0, 0},
+        {AAUDIO_PERFORMANCE_MODE_NONE, 1, 0},
+        {AAUDIO_PERFORMANCE_MODE_NONE, 1, 1},
+    };
+    const int n = (int)(sizeof chain / sizeof chain[0]);
+    for (int i = 0; i < n; i++) {
+        int last = i == n - 1;
+        uint32_t want_ch = chain[i].ch2 && s->channels > 2 ? 2 : s->channels;
+        if (chain[i].ch2 && s->channels <= 2 && !chain[i].fl) continue; /* same as the step before */
+        aaudio_format_t want_fmt = chain[i].fl ? AAUDIO_FORMAT_PCM_FLOAT : AAUDIO_FORMAT_PCM_I16;
+        AAudioStreamBuilder *b = NULL;
+        aaudio_result_t r = AAudio_createStreamBuilder(&b);
+        if (r != AAUDIO_OK) {
+            som_log("audout: AAudio_createStreamBuilder failed: %s", AAudio_convertResultToText(r));
+            s->open_fails++;
+            return;
+        }
+        AAudioStreamBuilder_setFormat(b, want_fmt);
+        AAudioStreamBuilder_setSampleRate(b, (int32_t)s->rate);
+        AAudioStreamBuilder_setChannelCount(b, (int32_t)want_ch);
+        AAudioStreamBuilder_setPerformanceMode(b, chain[i].perf);
+        AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
+        AAudioStreamBuilder_setContentType(b, AAUDIO_CONTENT_TYPE_MUSIC);
+        AAudioStreamBuilder_setDataCallback(b, sink_cb, s);
+        AAudioStreamBuilder_setErrorCallback(b, sink_err_cb, s);
+        AAudioStream *st = NULL;
+        r = AAudioStreamBuilder_openStream(b, &st);
+        AAudioStreamBuilder_delete(b);
+        if (r != AAUDIO_OK) {
+            som_log("audout: AAudio open #%d (%s, %u ch, %s) failed: %s", i, perf_name(chain[i].perf), want_ch,
+                    chain[i].fl ? "float" : "i16", AAudio_convertResultToText(r));
+            s->open_fails++;
+            continue;
+        }
+        int32_t got_rate = AAudioStream_getSampleRate(st), got_ch = AAudioStream_getChannelCount(st);
+        aaudio_format_t got_fmt = AAudioStream_getFormat(st);
+        int exact = got_rate == (int32_t)s->rate && got_ch == (int32_t)want_ch && got_fmt == want_fmt;
+        int usable = got_ch >= 1 && got_ch <= 8 && (got_fmt == AAUDIO_FORMAT_PCM_I16 || got_fmt == AAUDIO_FORMAT_PCM_FLOAT);
+        som_log("audout: AAudio open #%d asked %u Hz %u ch %s %s -> got %d Hz %d ch fmt %d, %s, %s sharing, burst %d, "
+                "buffer %d/%d frames, device %d%s",
+                i, s->rate, want_ch, chain[i].fl ? "float" : "i16", perf_name(chain[i].perf), got_rate, got_ch, (int)got_fmt,
+                perf_name(AAudioStream_getPerformanceMode(st)),
+                AAudioStream_getSharingMode(st) == AAUDIO_SHARING_MODE_EXCLUSIVE ? "exclusive" : "shared",
+                AAudioStream_getFramesPerBurst(st), AAudioStream_getBufferSizeInFrames(st),
+                AAudioStream_getBufferCapacityInFrames(st), AAudioStream_getDeviceId(st),
+                exact ? "" : usable && last ? " (mismatch, taking it anyway)" : " (mismatch, trying next)");
+        if (!exact && !(usable && last)) {
+            AAudioStream_close(st);
+            continue;
+        }
+        if (got_rate != (int32_t)s->rate) som_log("audout: WARNING stream rate %d != game rate %u: pitch will be off", got_rate, s->rate);
+        s->out_ch = (uint32_t)got_ch;
+        s->out_float = got_fmt == AAUDIO_FORMAT_PCM_FLOAT;
+        /* prime with at least one burst + 10 ms: non-low-latency streams ask for ~40 ms at a time */
+        int32_t burst = AAudioStream_getFramesPerBurst(st);
+        s->prime_frames = s->rate / 25;
+        if (burst > 0 && (uint32_t)burst + s->rate / 100 > s->prime_frames) s->prime_frames = (uint32_t)burst + s->rate / 100;
+        s->st = st;
+        return;
+    }
+    som_log("audout: no AAudio configuration worked: NO SOUND");
+}
+
+static void sink_start_locked(Sink *s) {
+    if (!s->st || atomic_load(&g_audio_paused)) return;
+    s->primed = 0;
+    aaudio_result_t r = AAudioStream_requestStart(s->st);
+    som_log("audout: AAudio start %s", AAudio_convertResultToText(r));
+}
+
+/* AAudio forbids closing/reopening from its own error callback: do it on a helper thread. */
+static void *sink_reopen_thread(void *arg) {
+    Sink *s = arg;
+    struct timespec ts = {0, 50000000}; /* let the audio server settle (route change, restart) */
+    for (int attempt = 0; attempt < 20; attempt++) {
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&s->mu);
+        if (s->st) {
+            AAudioStream_close(s->st);
+            s->st = NULL;
+        }
+        sink_open_stream(s);
+        sink_start_locked(s);
+        int ok = s->st != NULL;
+        s->reopens++;
+        pthread_mutex_unlock(&s->mu);
+        if (ok) break;
+        ts.tv_sec = 1, ts.tv_nsec = 0; /* keep trying once a second for a while */
+        if (attempt == 19) audio_fail_report("the stream was lost (error %d) and could not be reopened after 20 tries", s->last_error);
+    }
+    atomic_store(&s->reopening, 0);
+    return NULL;
+}
+
+static void sink_err_cb(AAudioStream *st, void *user, aaudio_result_t err) {
+    (void)st;
+    Sink *s = user;
+    s->last_error = err;
+    som_log("audout: AAudio stream error %s: reopening", AAudio_convertResultToText(err));
+    if (atomic_exchange(&s->reopening, 1)) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, sink_reopen_thread, s) == 0) pthread_detach(t);
+    else atomic_store(&s->reopening, 0);
 }
 
 static Sink *sink_open(uint32_t rate, uint32_t channels) {
     Sink *s = calloc(1, sizeof *s);
-    s->rate = rate, s->channels = channels;
-    s->ring = calloc((size_t)SINK_FRAMES * channels, 2);
-    AAudioStreamBuilder *b = NULL;
-    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return s;
-    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setSampleRate(b, (int32_t)rate);
-    AAudioStreamBuilder_setChannelCount(b, (int32_t)channels);
-    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
-    AAudioStreamBuilder_setDataCallback(b, sink_cb, s);
-    aaudio_result_t r = AAudioStreamBuilder_openStream(b, &s->st);
-    AAudioStreamBuilder_delete(b);
-    if (r != AAUDIO_OK) {
-        som_log("audout: AAudio stream failed to open: %s", AAudio_convertResultToText(r));
-        s->st = NULL;
-        return s;
-    }
-    r = AAudioStream_requestStart(s->st);
-    som_log("audout: AAudio stream %u Hz %u ch, burst %d frames, start %s", AAudioStream_getSampleRate(s->st),
-            (unsigned)AAudioStream_getChannelCount(s->st), AAudioStream_getFramesPerBurst(s->st), AAudio_convertResultToText(r));
+    pthread_mutex_init(&s->mu, NULL);
+    s->rate = rate, s->channels = channels > 8 ? 8 : channels;
+    s->out_ch = s->channels;
+    s->prime_frames = rate / 25;
+    s->ring = calloc((size_t)SINK_FRAMES * s->channels, 2);
+    pthread_mutex_lock(&s->mu);
+    sink_open_stream(s);
+    sink_start_locked(s);
+    int failed = !s->st;
+    pthread_mutex_unlock(&s->mu);
+    if (failed) audio_fail_report("no AAudio stream could be opened for %u Hz %u ch (%u attempts failed)", rate, channels, s->open_fails);
     return s;
 }
 
+/* The ring is filled even while there is no stream (reopen in progress), so playback resumes with current audio. */
 static void sink_write(Sink *s, const int16_t *pcm, uint64_t frames) {
-    if (!s || !s->st || !pcm) return;
+    if (!s || !s->ring || !pcm) return;
     uint64_t wr = atomic_load_explicit(&s->wr, memory_order_relaxed), rd = atomic_load_explicit(&s->rd, memory_order_acquire);
     uint64_t limit = s->rate / 4; /* keep at most 250 ms queued: drop the oldest */
     if (frames > limit) pcm += (frames - limit) * s->channels, frames = limit;
@@ -263,6 +492,32 @@ static void sink_write(Sink *s, const int16_t *pcm, uint64_t frames) {
     }
     for (uint64_t i = 0; i < frames; i++) memcpy(s->ring + ((wr + i) % SINK_FRAMES) * s->channels, pcm + i * s->channels, s->channels * 2);
     atomic_store_explicit(&s->wr, wr + frames, memory_order_release);
+}
+
+/* one-line sink state for the periodic stat log */
+static void sink_describe(Sink *s, char *buf, size_t len) {
+    if (!s) { snprintf(buf, len, "no sink"); return; }
+    if (pthread_mutex_trylock(&s->mu) != 0) { snprintf(buf, len, "sink busy (reopening)"); return; }
+    if (!s->st) {
+        snprintf(buf, len, "NO STREAM (open fails %u, reopens %u)", s->open_fails, s->reopens);
+    } else {
+        aaudio_stream_state_t state = AAudioStream_getState(s->st);
+        uint64_t cb = atomic_load(&s->callbacks), wr = atomic_load(&s->wr);
+        snprintf(buf, len, "stream state %s, %u ch %s, callbacks %llu, xruns %d, reopens %u, last error %d",
+                 AAudio_convertStreamStateToText(state), s->out_ch, s->out_float ? "float" : "i16",
+                 (unsigned long long)cb, AAudioStream_getXRunCount(s->st), s->reopens, s->last_error);
+        /* watchdog (called every ~2 s): the game keeps writing audio but the device stopped asking for it */
+        if (!atomic_load(&g_audio_paused) && !atomic_load(&s->reopening) && wr != s->wd_wr && cb == s->wd_cb) {
+            if (++s->wd_stuck == 3)
+                audio_fail_report("the stream is open (state %s, %u ch %s) but the device has not asked for audio in ~6 s; "
+                                  "%llu callbacks so far", AAudio_convertStreamStateToText(state), s->out_ch,
+                                  s->out_float ? "float" : "i16", (unsigned long long)cb);
+        } else {
+            s->wd_stuck = 0;
+        }
+        s->wd_cb = cb, s->wd_wr = wr;
+    }
+    pthread_mutex_unlock(&s->mu);
 }
 
 typedef struct AudOut {
@@ -333,13 +588,15 @@ static void audout_handler(IpcObject *self, const IpcRequest *rq, IpcResponse *r
         a->n_polls++;
         if (t - a->last_stat_ns > 2000000000ull) {
             a->last_stat_ns = t;
+            char sd[200];
+            sink_describe(a->sink, sd, sizeof sd);
             som_log("audout %p: appended %llu released %llu queued %d dropped %llu polls %llu started %u next due in %lld us; "
-                    "sink %llu ms queued, %llu underruns",
+                    "sink %llu ms queued, %llu underruns; %s",
                     (void *)a, (unsigned long long)a->n_app, (unsigned long long)a->n_rel, a->count,
                     (unsigned long long)a->n_drop, (unsigned long long)a->n_polls, a->started,
                     a->count ? (long long)(a->q[a->head].done_ns - t) / 1000 : -1ll,
                     a->sink ? (unsigned long long)((a->sink->wr - a->sink->rd) * 1000 / a->rate) : 0ull,
-                    a->sink ? (unsigned long long)a->sink->underruns : 0ull);
+                    a->sink ? (unsigned long long)a->sink->underruns : 0ull, sd);
         }
         pthread_mutex_unlock(&g_pace_mu);
         static int logged;
@@ -470,18 +727,22 @@ void services_audio_register(void) {
 /* Android background pause: stop the AAudio streams (and drop what was queued, so resuming does not replay stale
  * audio). The game itself is parked by som_guest_pause_all, so nothing new is written meanwhile. */
 void som_audio_pause_all(int on) {
+    atomic_store(&g_audio_paused, on);
     pthread_mutex_lock(&g_pace_mu);
     for (int i = 0; i < MAX_PACED; i++) {
         AudOut *a = g_audouts[i];
-        if (!a || !a->sink || !a->sink->st) continue;
+        if (!a || !a->sink) continue;
         Sink *s = a->sink;
-        if (on) {
-            AAudioStream_requestPause(s->st);
-        } else {
-            atomic_store(&s->rd, atomic_load(&s->wr));
-            s->primed = 0;
-            AAudioStream_requestStart(s->st);
+        pthread_mutex_lock(&s->mu);
+        if (s->st) {
+            if (on) {
+                AAudioStream_requestPause(s->st);
+            } else {
+                atomic_store(&s->rd, atomic_load(&s->wr));
+                sink_start_locked(s);
+            }
         }
+        pthread_mutex_unlock(&s->mu);
     }
     pthread_mutex_unlock(&g_pace_mu);
     som_log("audio %s", on ? "paused" : "resumed");

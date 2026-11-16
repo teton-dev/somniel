@@ -25,5 +25,17 @@ int movies_vp9_is_software(void);
 #define MOVIES_NAME_N 96
 int movies_recent_copies(char paths[][MOVIES_PATH_N], char names[][MOVIES_NAME_N], int max);
 
+/* Skip intro (sidebar): the opening movie the game plays at boot (S01F) is skipped with one A press, the game's own
+ * skip, once it is playing. movies_skip_buttons() is ORed into the pad state every frame (NP_A or 0); the movie
+ * decoder's Stop ends the attempt (movies_note_stop). Only the first time the movie plays in a run: the title screen's
+ * attract loop plays it again later, untouched. */
+void movies_set_skip_intro(int on);
+uint64_t movies_skip_buttons(void);
+void movies_note_stop(void);
+
+/* While the intro is being skipped (from the first read of the movie until SKIP_TAIL_NS after the skip lands) the
+ * game's sound output is silenced, so none of the intro's first seconds are heard (services_audio.c sink_cb). */
+int movies_audio_muted(void);
+
 /* a video packet reached the movie decoder: the converter pauses while one arrived in the last 2 s */
 void movies_playback_tick(void);

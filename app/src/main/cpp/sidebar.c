@@ -15,6 +15,11 @@ JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSidebarOpen(
 
 void som_set_frame_rate(int fps);    /* game_patches.c */
 void som_set_render_scale(int pct);  /* game_patches.c */
+void som_set_dynres(int on);         /* game_patches.c */
+
+JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSetDynamicResolution(JNIEnv *env, jclass cls, jboolean on) {
+    som_set_dynres(on ? 1 : 0);
+}
 
 /* The sidebar's frame rate (30, 40 or 60) and render scale (percent, 50 to 125): applied at once. */
 JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSetFrameRate(JNIEnv *env, jclass cls, jint fps) {
@@ -38,6 +43,18 @@ JNIEXPORT jint JNICALL Java_dev_teton_somniel_SomnielActivity_nativeDefaultFrame
     return som_handheld_profile() ? 30 : 60;
 }
 
+int som_gpu_is_mali(void); /* hooks_system.c */
+
+/* The GPU is a Mali: the defaults of Console mode and Hidden object culling (Graphics page) follow it. */
+JNIEXPORT jboolean JNICALL Java_dev_teton_somniel_SomnielActivity_nativeGpuIsMali(JNIEnv *env, jclass cls) {
+    return som_gpu_is_mali() ? JNI_TRUE : JNI_FALSE;
+}
+
+/* The console profile this run uses (latched at start): handheld or docked. */
+JNIEXPORT jboolean JNICALL Java_dev_teton_somniel_SomnielActivity_nativeIsHandheld(JNIEnv *env, jclass cls) {
+    return som_handheld_profile() ? JNI_TRUE : JNI_FALSE;
+}
+
 extern uint64_t som_gfx_presents;
 
 /* True once the game has presented a frame: the Java splash overlay goes away then. */
@@ -47,6 +64,17 @@ JNIEXPORT jboolean JNICALL Java_dev_teton_somniel_SomnielActivity_nativeGameHasF
 
 JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSetMonitorLevel(JNIEnv *env, jclass cls, jint level) {
     overlay_set_level(level);
+}
+
+void movies_set_skip_intro(int on); /* movies.c */
+
+
+JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSetSkipIntro(JNIEnv *env, jclass cls, jboolean on) {
+    movies_set_skip_intro(on ? 1 : 0);
+}
+
+JNIEXPORT void JNICALL Java_dev_teton_somniel_SomnielActivity_nativeSetBatteryTemp(JNIEnv *env, jclass cls, jint celsius) {
+    overlay_set_battery_temp(celsius);
 }
 
 void som_touch_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry); /* main.c */

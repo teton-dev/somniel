@@ -183,20 +183,10 @@ final class SaveImporter {
         Uri uri = cr.insert(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), v);
         if (uri == null) throw new IOException("could not create the backup in " + BACKUP_DIR);
         try {
-            long want = 0;
+            long want;
             try (OutputStream os = cr.openOutputStream(uri, "w")) {
                 if (os == null) throw new IOException("could not write the backup");
-                ZipOutputStream z = new ZipOutputStream(os);
-                byte[] buf = new byte[1 << 16];
-                for (File f : files) {
-                    z.putNextEntry(new ZipEntry(rel(root, f)));
-                    try (InputStream in = new FileInputStream(f)) {
-                        for (int r; (r = in.read(buf)) > 0; ) z.write(buf, 0, r);
-                    }
-                    z.closeEntry();
-                    want += f.length();
-                }
-                z.finish();
+                want = writeZip(os, root, files);
             }
             int got = 0;
             long gotBytes = 0;
@@ -216,6 +206,70 @@ final class SaveImporter {
             try { cr.delete(uri, null, null); } catch (Exception ignored) {}
             throw e;
         }
+    }
+
+    // ---- export ----
+
+    /** True when there is at least one save file to export. */
+    static boolean hasSaves(Context ctx) {
+        List<File> files = new ArrayList<>();
+        listFiles(saveRoot(ctx), files);
+        return !files.isEmpty();
+    }
+
+    /** A default file name for an export: Engage-saves-<date>_<time>.zip */
+    static String exportName() {
+        return "Engage-saves-" + new SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.US).format(new Date()) + ".zip";
+    }
+
+    /**
+     * Writes every file under <data>/save as a zip to the document the user picked, then reads it back to check it.
+     * The zip has the same layout as the backups, so Import accepts it as it is. Returns the number of files. Blocking.
+     */
+    static int exportTo(Context ctx, Uri uri) throws IOException {
+        File root = saveRoot(ctx);
+        List<File> files = new ArrayList<>();
+        listFiles(root, files);
+        if (files.isEmpty()) throw new IOException("there are no saves to export yet");
+        ContentResolver cr = ctx.getContentResolver();
+        try {
+            long want;
+            try (OutputStream os = cr.openOutputStream(uri, "wt")) {
+                if (os == null) throw new IOException("could not write the file");
+                want = writeZip(os, root, files);
+            }
+            int got = 0;
+            long gotBytes = 0;
+            try (InputStream is = cr.openInputStream(uri); ZipInputStream z = new ZipInputStream(is)) {
+                byte[] buf = new byte[1 << 16];
+                for (ZipEntry e; (e = z.getNextEntry()) != null; ) {
+                    got++;
+                    for (int r; (r = z.read(buf)) > 0; ) gotBytes += r;
+                }
+            }
+            if (got != files.size() || gotBytes != want) throw new IOException("the exported file did not check out");
+            som("saves exported: " + files.size() + " files");
+            return files.size();
+        } catch (IOException | RuntimeException e) {
+            try { android.provider.DocumentsContract.deleteDocument(cr, uri); } catch (Exception ignored) {}
+            throw e;
+        }
+    }
+
+    /** Zips the files (names relative to root) into os; returns the total bytes of file data written. */
+    private static long writeZip(OutputStream os, File root, List<File> files) throws IOException {
+        long want = 0;
+        ZipOutputStream z = new ZipOutputStream(os);
+        byte[] buf = new byte[1 << 16];
+        for (File f : files) {
+            z.putNextEntry(new ZipEntry(rel(root, f)));
+            try (InputStream in = new FileInputStream(f)) {
+                for (int r; (r = in.read(buf)) > 0; ) { z.write(buf, 0, r); want += r; }
+            }
+            z.closeEntry();
+        }
+        z.finish();
+        return want;
     }
 
     // ---- helpers ----

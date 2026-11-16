@@ -703,7 +703,7 @@ NVN_API(nvnWindowSetCrop) {
 // ready, at most at the frame limit (TOTK_FPS_LIMIT: 30 to 360 per second or the monitor's rate): holding it to the
 // 2nd or 3rd tick would only add latency and 50 ms frames.
 #define VSYNC_HZ 60ull
-extern int som_target_fps(void); /* game_patches.c: the sidebar's frame rate (30, 40, 60), 0 = follow the game */
+extern int som_target_fps(void); /* game_patches.c: the sidebar's frame rate (20, 30, 40, 45, 60), 0 = follow the game */
 static uint64_t present_period(const win_t *o) {
     if (frame_step_realtime()) return frame_step_cap_ns();
     int fps = som_target_fps();

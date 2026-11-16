@@ -87,7 +87,7 @@ final class Telemetry {
     boolean enabled() { return available() && Boolean.TRUE.equals(consent()); }
 
     void setConsent(boolean yes) {
-        prefs.edit().putBoolean("consent", yes).apply();
+        prefs.edit().putBoolean("consent", yes).commit();
         if (yes) start();
         else {
             stop();
@@ -98,13 +98,13 @@ final class Telemetry {
     }
 
     /** A new random id (the old one is forgotten: the server can no longer link new data to the old). */
-    void resetId() { prefs.edit().remove("install_id").apply(); }
+    void resetId() { prefs.edit().remove("install_id").commit(); }
 
     private String installId() {
         String id = prefs.getString("install_id", null);
         if (id == null) {
             id = UUID.randomUUID().toString();
-            prefs.edit().putString("install_id", id).apply();
+            prefs.edit().putString("install_id", id).commit();
         }
         return id;
     }
@@ -184,7 +184,7 @@ final class Telemetry {
                 .setView(box)
                 .setCancelable(false)
                 .setPositiveButton("I understand", (di, w) -> {
-                    if (hide.isChecked()) prefs.edit().putBoolean("gpu_warning_hidden", true).apply();
+                    if (hide.isChecked()) prefs.edit().putBoolean("gpu_warning_hidden", true).commit();
                     if (then != null) then.run();
                 })
                 .create();

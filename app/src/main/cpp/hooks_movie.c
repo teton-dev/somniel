@@ -810,6 +810,7 @@ static void dec_start(GuestCtx *c) {
 static void dec_stop(GuestCtx *c) {
     Dec *d = dec_of(c);
     CALL_LOG("Stop");
+    movies_note_stop();
     if (!d) return ret_x(c, ST_BAD_ARG);
     worker_stop(d);
     if (d->mc && d->started) AMediaCodec_stop(d->mc);
