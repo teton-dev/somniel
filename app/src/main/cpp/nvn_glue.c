@@ -136,6 +136,12 @@ static void log_chain(int id, GuestCtx *c) {
 
 static void stall_dump(void) {
     som_log("stall: no submit for 8 s, dumping");
+    {   /* fault marker: the next launch asks the user whether to save the log (LogExporter.stashPreviousFault) */
+        char p[600];
+        snprintf(p, sizeof p, "%s/fault_stall.txt", som_log_dir());
+        FILE *f = fopen(p, "w");
+        if (f) { fputs("Renderer stalled: no GPU submit for 8 s\n", f); fclose(f); }
+    }
     sync_debug_dump();
     for (int i = 0; i < WD_THREADS; i++) {
         GuestCtx *c = g_ctx_of[i];

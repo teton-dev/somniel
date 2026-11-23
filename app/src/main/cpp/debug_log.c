@@ -1,9 +1,11 @@
 #include "debug_log.h"
 
 #include <android/log.h>
+#include <jni.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -100,4 +102,62 @@ void som_log_shutdown(void) {
     if (g_trace) fclose(g_trace);
     g_log = g_perf = g_trace = NULL;
     pthread_mutex_unlock(&g_lock);
+}
+
+/* ---- export of somniel.log to Download/somniel_logs (LogExporter.java) ---- */
+void *SDL_GetAndroidJNIEnv(void);
+void *SDL_GetAndroidActivity(void);
+
+typedef struct { char prefix[48], reason[256]; } ExportJob;
+
+static void *export_thread(void *arg) {
+    ExportJob *j = (ExportJob *)arg;
+    sleep(3); /* let the next few log lines (stats, retries, the stall dump) land in the copy */
+    char path[600];
+    snprintf(path, sizeof path, "%s/somniel.log", som_log_dir());
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = env ? (jobject)SDL_GetAndroidActivity() : NULL;
+    int ok = 0;
+    if (env && act) {
+        /* app classes are not visible to FindClass on a native thread: go through the activity's class loader */
+        jclass ak = (*env)->GetObjectClass(env, act);
+        jmethodID gcl = (*env)->GetMethodID(env, ak, "getClassLoader", "()Ljava/lang/ClassLoader;");
+        jobject loader = gcl ? (*env)->CallObjectMethod(env, act, gcl) : NULL;
+        jclass lk = loader ? (*env)->GetObjectClass(env, loader) : NULL;
+        jmethodID lc = lk ? (*env)->GetMethodID(env, lk, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") : NULL;
+        jstring cn = (*env)->NewStringUTF(env, "dev.teton.somniel.LogExporter");
+        jclass ek = lc ? (jclass)(*env)->CallObjectMethod(env, loader, lc, cn) : NULL;
+        if ((*env)->ExceptionCheck(env)) ek = NULL;
+        jmethodID m = ek ? (*env)->GetStaticMethodID(env, ek, "exportLog",
+                                                     "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V") : NULL;
+        if (m) {
+            jstring jp = (*env)->NewStringUTF(env, path), jf = (*env)->NewStringUTF(env, j->prefix),
+                    jr = (*env)->NewStringUTF(env, j->reason);
+            (*env)->CallStaticVoidMethod(env, ek, m, act, jp, jf, jr);
+            ok = !(*env)->ExceptionCheck(env);
+            (*env)->DeleteLocalRef(env, jp);
+            (*env)->DeleteLocalRef(env, jf);
+            (*env)->DeleteLocalRef(env, jr);
+        }
+        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+        (*env)->DeleteLocalRef(env, cn);
+        if (ek) (*env)->DeleteLocalRef(env, ek);
+        if (lk) (*env)->DeleteLocalRef(env, lk);
+        if (loader) (*env)->DeleteLocalRef(env, loader);
+        (*env)->DeleteLocalRef(env, ak);
+        (*env)->DeleteLocalRef(env, act);
+    }
+    som_log("log export (%s) %s", j->prefix, ok ? "handed to LogExporter" : "FAILED (no JNI/activity/class)");
+    free(j);
+    return NULL;
+}
+
+void som_export_log(const char *prefix, const char *reason) {
+    ExportJob *j = calloc(1, sizeof *j);
+    if (!j) return;
+    snprintf(j->prefix, sizeof j->prefix, "%s", prefix);
+    snprintf(j->reason, sizeof j->reason, "%s", reason);
+    pthread_t t;
+    if (pthread_create(&t, NULL, export_thread, j) == 0) pthread_detach(t);
+    else free(j);
 }

@@ -144,6 +144,7 @@ public class SomnielActivity extends SDLActivity {
         super.onCreate(savedInstanceState);
         goImmersive();
         showSplash(); // first, so the setup dialog, sidebar and notices all draw above it
+        final String faultReason = LogExporter.stashPreviousFault(this); // before the native side truncates somniel.log
         telemetry = new Telemetry(this); // before the sidebar: it shows the opt-in toggle
         touch = new TouchControls(this); // below the sidebar, above the game
         touch.setListener(new TouchControls.Listener() {
@@ -156,6 +157,7 @@ public class SomnielActivity extends SDLActivity {
         addContentView(setup.view(), new ViewGroup.LayoutParams(-1, -1));
         if (!SetupDialog.gameFilesPresent(this)) setup.show(); // first boot: ask for the user's game files
         updateTouchControls();
+        if (faultReason != null) getWindow().getDecorView().post(() -> LogExporter.askToSave(this, faultReason));
         android.hardware.input.InputManager im = (android.hardware.input.InputManager) getSystemService(INPUT_SERVICE);
         im.registerInputDeviceListener(new android.hardware.input.InputManager.InputDeviceListener() {
             @Override public void onInputDeviceAdded(int id) { updateTouchControls(); }

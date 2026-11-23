@@ -7,6 +7,9 @@ extern "C" {
 #endif
 
 void som_log_init(const char *dir);
+/* Saves somniel.log (after a 3 s delay so the next lines land) to Download/somniel_logs through LogExporter.java
+ * and toasts where it went. Safe from any thread; returns at once. prefix names the file, reason heads it. */
+void som_export_log(const char *prefix, const char *reason);
 const char *som_log_dir(void); /* the internal files directory given to som_log_init ("" before it): somniel.log lives there */
 void som_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* svc_trace.log only. Off unless <internal files>/svc_trace.on exists at start (adb shell run-as dev.teton.somniel

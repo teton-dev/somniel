@@ -358,6 +358,8 @@ final class Sidebar {
             shareRow = check("Share anonymous performance & crash data", tel.enabled(), on -> { if (!shareBusy) tel.setConsent(on); });
             mainPage.addView(shareRow);
         }
+        mainPage.addView(row("Save diagnostic log", v -> new Thread(() ->
+                LogExporter.exportLog(act, LogExporter.logPath(act), "somniel_manual", "Saved by the user from the sidebar")).start()));
         mainPage.addView(check("Check for updates at startup", act.updateCheckEnabled(), on -> act.setUpdateCheckEnabled(on)));
         mainPage.addView(row("Check for updates", v -> act.checkForUpdates(true)));
         mainPage.addView(divider());

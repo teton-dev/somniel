@@ -225,52 +225,9 @@ typedef struct Sink {
 
 static _Atomic int g_audio_paused;
 
-/* ---- audio failure report: once per run, copy somniel.log to Download/Somniel_log (LogExporter.java) and show a
- * toast, so a user on a device we cannot test can send us the log without adb. ---- */
-#include <jni.h>
-void *SDL_GetAndroidJNIEnv(void);
-void *SDL_GetAndroidActivity(void);
-
+/* ---- audio failure report: once per run, save somniel.log to Download/somniel_logs (som_export_log) ---- */
 static _Atomic int g_fail_reported;
 static char g_fail_reason[256];
-
-static void *fail_report_thread(void *arg) {
-    (void)arg;
-    sleep(3); /* let the next few log lines (stats, retries) land in the copy */
-    char path[600];
-    snprintf(path, sizeof path, "%s/somniel.log", som_log_dir());
-    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
-    jobject act = env ? (jobject)SDL_GetAndroidActivity() : NULL;
-    int ok = 0;
-    if (env && act) {
-        /* app classes are not visible to FindClass on a native thread: go through the activity's class loader */
-        jclass ak = (*env)->GetObjectClass(env, act);
-        jmethodID gcl = (*env)->GetMethodID(env, ak, "getClassLoader", "()Ljava/lang/ClassLoader;");
-        jobject loader = gcl ? (*env)->CallObjectMethod(env, act, gcl) : NULL;
-        jclass lk = loader ? (*env)->GetObjectClass(env, loader) : NULL;
-        jmethodID lc = lk ? (*env)->GetMethodID(env, lk, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") : NULL;
-        jstring cn = (*env)->NewStringUTF(env, "dev.teton.somniel.LogExporter");
-        jclass ek = lc ? (jclass)(*env)->CallObjectMethod(env, loader, lc, cn) : NULL;
-        if ((*env)->ExceptionCheck(env)) ek = NULL;
-        jmethodID m = ek ? (*env)->GetStaticMethodID(env, ek, "saveAudioLog", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)V") : NULL;
-        if (m) {
-            jstring jp = (*env)->NewStringUTF(env, path), jr = (*env)->NewStringUTF(env, g_fail_reason);
-            (*env)->CallStaticVoidMethod(env, ek, m, act, jp, jr);
-            ok = !(*env)->ExceptionCheck(env);
-            (*env)->DeleteLocalRef(env, jp);
-            (*env)->DeleteLocalRef(env, jr);
-        }
-        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
-        (*env)->DeleteLocalRef(env, cn);
-        if (ek) (*env)->DeleteLocalRef(env, ek);
-        if (lk) (*env)->DeleteLocalRef(env, lk);
-        if (loader) (*env)->DeleteLocalRef(env, loader);
-        (*env)->DeleteLocalRef(env, ak);
-        (*env)->DeleteLocalRef(env, act);
-    }
-    som_log("audio: failure log export %s", ok ? "handed to LogExporter" : "FAILED (no JNI/activity/class)");
-    return NULL;
-}
 
 static void audio_fail_report(const char *fmt, ...) {
     if (atomic_exchange(&g_fail_reported, 1)) return;
@@ -278,9 +235,8 @@ static void audio_fail_report(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_fail_reason, sizeof g_fail_reason, fmt, ap);
     va_end(ap);
-    som_log("audio: FAILURE: %s (saving the log to Download/Somniel_log)", g_fail_reason);
-    pthread_t t;
-    if (pthread_create(&t, NULL, fail_report_thread, NULL) == 0) pthread_detach(t);
+    som_log("audio: FAILURE: %s (saving the log to Download/somniel_logs)", g_fail_reason);
+    som_export_log("somniel_audio", g_fail_reason);
 }
 
 /* one output frame from one ring frame: copy, downmix 5.1 (FL FR FC LFE BL BR) / anything to stereo or mono, or pad */
